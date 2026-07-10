@@ -146,6 +146,52 @@ void compatLogFmt(const char* fmt, ...) {
     compatLog(buf);
 }
 
+// Logged first, before anything else touches compat_log.txt — a compat
+// report reviewer needs to be able to confirm the log they're reading
+// actually came from the Android Horizon build (and CFW/firmware) the
+// submitter claims, not a stale or mismatched one. Firmware comes from the
+// "set" service (works under any CFW); Atmosphere's version specifically
+// is only resolvable via the Exosphere API version SPL config item, which
+// only succeeds when actually running under Atmosphere — a failure there
+// just means "not Atmosphere, or couldn't tell," not a real error, so it's
+// logged as unknown rather than treated as a fault.
+static void logEnvironmentHeader() {
+    compatLogFmt("env: Android Horizon (Translation Core) build 0.1.%d", BUILD_NUMBER);
+
+    Result rc = setsysInitialize();
+    if (R_SUCCEEDED(rc)) {
+        SetSysFirmwareVersion fw;
+        if (R_SUCCEEDED(setsysGetFirmwareVersion(&fw)))
+            compatLogFmt("env: Switch firmware %s", fw.display_version);
+        else
+            compatLog("env: Switch firmware unknown (setsysGetFirmwareVersion failed)");
+        setsysExit();
+    } else {
+        compatLog("env: Switch firmware unknown (set service unavailable)");
+    }
+
+    rc = splInitialize();
+    if (R_SUCCEEDED(rc)) {
+        // libnx's own SplConfigItem enum only covers stock Nintendo SPL
+        // config items (see switch/services/spl.h) — it doesn't name this
+        // one because it's an Atmosphere-specific private extension to the
+        // same API, not part of the real SPL service. 65000 is the value
+        // Atmosphere itself (and other homebrew that reads its version,
+        // e.g. hbmenu) uses; there's no official libnx constant for it.
+        const SplConfigItem SplConfigItem_ExosphereApiVersion = (SplConfigItem)65000;
+        u64 raw = 0;
+        if (R_SUCCEEDED(splGetConfig(SplConfigItem_ExosphereApiVersion, &raw))) {
+            u32 major = (raw >> 56) & 0xFF, minor = (raw >> 48) & 0xFF, micro = (raw >> 40) & 0xFF;
+            compatLogFmt("env: Atmosphere %u.%u.%u", major, minor, micro);
+        } else {
+            compatLog("env: Atmosphere version unknown (not Atmosphere, or API unavailable)");
+        }
+        splExit();
+    } else {
+        compatLog("env: Atmosphere version unknown (spl service unavailable)");
+    }
+}
+
 static void androidTlsInstall() {
     uint64_t old_tp;
     asm volatile("mrs %0, tpidr_el0" : "=r"(old_tp));
@@ -470,6 +516,7 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     std::string log_path = "sdmc:/AndroidHorizonNX/compat_log.txt";
     g_compat_log = fopen(log_path.c_str(), "w");
     g_log_start_t = armGetSystemTick();
+    logEnvironmentHeader();
     compatLogFmt("launchApk: %s  pkg=%s  installed=%d",
                  apk_path.c_str(), pkg_name.c_str(), (int)already_installed);
 
