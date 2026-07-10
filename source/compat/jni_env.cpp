@@ -141,6 +141,7 @@ static void udWriteSnapshot(const UdSnapshot& snap) {
 // due save no longer costs the caller a frame stall at all.
 static Thread  g_save_thread;
 static bool    g_save_thread_started = false;
+static Mutex   g_save_start_lock;   // guards the check-then-create below only
 static Mutex   g_save_pending_lock;
 static CondVar g_save_pending_cv;
 static bool    g_save_pending = false;
@@ -157,8 +158,14 @@ static void udSaveThreadFn(void*) {
     }
 }
 
+// UserDefault.flush() is documented as coming from "almost always the main
+// game thread" — not guaranteed, and this game does spin up real pthreads
+// (see the pthread_create shim). Without a lock here, two threads racing
+// through the check on first flush could both see g_save_thread_started ==
+// false and both threadCreate()/condvarInit() the same globals.
 static bool ensureSaveThreadStarted() {
-    if (g_save_thread_started) return true;
+    mutexLock(&g_save_start_lock);
+    if (g_save_thread_started) { mutexUnlock(&g_save_start_lock); return true; }
     condvarInit(&g_save_pending_cv);
     // Small stack (just fopen/fwrite/rename, no game logic) and off the
     // render core, same convention as the pthread_create shim's worker
@@ -170,9 +177,11 @@ static bool ensureSaveThreadStarted() {
     if (R_SUCCEEDED(rc)) rc = threadStart(&g_save_thread);
     if (R_FAILED(rc)) {
         compatLogFmt("UserDefaults: background save thread failed 0x%x — saves will be synchronous", rc);
+        mutexUnlock(&g_save_start_lock);
         return false;
     }
     g_save_thread_started = true;
+    mutexUnlock(&g_save_start_lock);
     return true;
 }
 
