@@ -172,6 +172,13 @@ static void logEnvironmentHeader() {
 
     rc = splInitialize();
     if (R_SUCCEEDED(rc)) {
+        // libnx's own SplConfigItem enum only covers stock Nintendo SPL
+        // config items (see switch/services/spl.h) — it doesn't name this
+        // one because it's an Atmosphere-specific private extension to the
+        // same API, not part of the real SPL service. 65000 is the value
+        // Atmosphere itself (and other homebrew that reads its version,
+        // e.g. hbmenu) uses; there's no official libnx constant for it.
+        const SplConfigItem SplConfigItem_ExosphereApiVersion = (SplConfigItem)65000;
         u64 raw = 0;
         if (R_SUCCEEDED(splGetConfig(SplConfigItem_ExosphereApiVersion, &raw))) {
             u32 major = (raw >> 56) & 0xFF, minor = (raw >> 48) & 0xFF, micro = (raw >> 40) & 0xFF;
