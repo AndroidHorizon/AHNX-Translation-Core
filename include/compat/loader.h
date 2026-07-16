@@ -207,6 +207,11 @@ void         jniSetup(CompatLayer* cl);
 // the game's registered Java_ native callbacks.
 void*        compatFindGameSym(const char* name);
 
+// Look up a native method the game registered via JNI RegisterNatives (by
+// method name, e.g. "nativeRender"). Unity/IL2CPP register their whole player
+// API this way instead of exporting Java_ symbols. Returns the fn ptr or null.
+void*        jniFindRegisteredNative(const char* name);
+
 // Normal (mutex-serialized, dedup'd) logger to compat_log.txt. compatLog
 // writes one line; compatLogFmt is printf-style; compatLogFlush forces the
 // buffered file to disk. Defined in loader.cpp.

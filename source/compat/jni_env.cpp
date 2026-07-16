@@ -796,6 +796,16 @@ static jint s_RegisterNatives(JNIEnv*, jclass, const JNINativeMethod* m, jint n)
     return JNI_OK;
 }
 static jint s_UnregisterNatives(JNIEnv*, jclass) { return JNI_OK; }
+
+// Look up a RegisterNatives-registered native by method name (Unity/IL2CPP
+// register their whole player API this way rather than exporting Java_ symbols,
+// so the Unity runtime finds nativeRender/initJni/etc. through here).
+void* jniFindRegisteredNative(const char* name) {
+    if (!name) return nullptr;
+    for (const auto& m : g_native_methods)
+        if (m.name && strcmp(m.name, name) == 0) return (void*)m.fnPtr;
+    return nullptr;
+}
 static jint s_MonitorEnter(JNIEnv*, jobject) { return 0; }
 static jint s_MonitorExit(JNIEnv*, jobject)  { return 0; }
 static jint s_GetJavaVM(JNIEnv*, JavaVM** out) {
