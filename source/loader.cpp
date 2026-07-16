@@ -2,6 +2,7 @@
 #include "compat/android.h"
 #include "compat/sha256.h"
 #include "build_number.h"
+#include "unity/unity_runtime.h"   // AHNX-Unity-Runtime submodule
 #include <switch.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -1311,6 +1312,30 @@ void runGameOnMainThread(void* game_so_ptr,
     // it's doing decode work); anything else ran on a background thread.
     compatLogFmt("main/render thread tid=%p", (void*)threadGetSelf());
     compatLogFlush();
+
+    // ── Unity IL2CPP games take a completely different path ─────────────────
+    // Detected by libunity.so being loaded (see engine detection in launchApk).
+    // Hand off to the AHNX-Unity-Runtime submodule, which reproduces Unity's
+    // native boot from here. It runs on this main thread with the GL context
+    // current, same as the cocos2d-x loop below. When it returns we're done —
+    // the diagnostics are in compat_log.txt.
+    {
+        std::string lib_dir = data_path + "/lib";
+        if (unityIsGame(lib_dir)) {
+            compatUiLog("Unity game — starting Unity runtime bringup");
+            UnityLaunchResult ur = unityRun(lib_dir, apk_path, data_path,
+                                            g_compat.activity.internalDataPath
+                                            ? g_compat.activity.internalDataPath : "");
+            if (!ur.ok) {
+                compatLogFmt("unity: bringup did not reach a running game — stage=%s detail=%s",
+                             ur.errorStage ? ur.errorStage : "?", ur.errorDetail.c_str());
+                compatUiLog(ur.errorStage ? ur.errorStage : "Unity bringup incomplete");
+            }
+            appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+            if (g_compat_log) { logFlushDedup(); fclose(g_compat_log); g_compat_log = nullptr; }
+            return;
+        }
+    }
 
     JNIEnv* env = (JNIEnv*)g_compat.env_outer;
     jobject obj = (jobject)(uintptr_t)0x4001;

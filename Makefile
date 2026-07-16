@@ -12,9 +12,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	AHNX-Translation-Core-x64
 BUILD		:=	build
-SOURCES		:=	source source/compat
+SOURCES		:=	source source/compat unity-runtime/src
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	include unity-runtime/include
 ROMFS		:=	romfs
 
 APP_TITLE	:= AHNX Translation Core (x64)
