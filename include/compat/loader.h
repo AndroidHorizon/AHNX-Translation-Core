@@ -207,6 +207,13 @@ void         jniSetup(CompatLayer* cl);
 // the game's registered Java_ native callbacks.
 void*        compatFindGameSym(const char* name);
 
+// Normal (mutex-serialized, dedup'd) logger to compat_log.txt. compatLog
+// writes one line; compatLogFmt is printf-style; compatLogFlush forces the
+// buffered file to disk. Defined in loader.cpp.
+void         compatLog(const char* msg);
+void         compatLogFmt(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void         compatLogFlush(void);
+
 // Lock-free logger for crash-forensics paths only (see loader.cpp) — never
 // use this for normal logging, it can interleave with concurrent compatLog
 // calls. Exists so a fault can always be recorded even if the crashing
