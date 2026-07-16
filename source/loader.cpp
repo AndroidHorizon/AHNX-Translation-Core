@@ -1,5 +1,6 @@
 #include "compat/loader.h"
 #include "compat/android.h"
+#include "compat/sha256.h"
 #include "build_number.h"
 #include <switch.h>
 #include <SDL2/SDL.h>
@@ -40,6 +41,11 @@ extern volatile uint64_t g_recover_far;
 // remain valid after launchApk returns (for runGameOnMainThread).
 static std::string g_base_dir_stored;
 static std::string g_apk_path_stored;
+
+// Per-APK framerate cap (0 = uncapped/default), set by the launcher's Manage
+// overlay and read here once at launch — see readFpsCap() and its use in
+// runGameOnMainThread's game loop below.
+static int g_fps_cap_stored = 0;
 
 // The running game's LoadedSo — lets jni_env.cpp invoke the game's registered
 // Java_ native callbacks (async replies the Java side would normally deliver,
@@ -487,6 +493,44 @@ static bool setupEGL(ANativeWindow* win) {
     return true;
 }
 
+// ─── Per-APK framerate cap ─────────────────────────────────────────────────────
+// Written by the launcher's Manage overlay as a plain integer in
+// games/<pkg>/.fps_cap (same simple-marker-file convention as .installed and
+// .apk_sha256). Missing file (never set, or explicitly cleared) means
+// uncapped/default — the game runs exactly as it did before this existed.
+static int readFpsCap(const std::string& base_dir) {
+    FILE* f = fopen((base_dir + "/.fps_cap").c_str(), "r");
+    if (!f) return 0;
+    int fps = 0;
+    if (fscanf(f, "%d", &fps) != 1) fps = 0;
+    fclose(f);
+    return (fps > 0 && fps <= 60) ? fps : 0;
+}
+
+// ─── APK integrity hash ────────────────────────────────────────────────────────
+// Hashing the whole raw APK is only cheap once — cache the result next to the
+// .installed marker so every subsequent launch (which skips extraction) reads
+// a 64-byte file instead of re-hashing a potentially 100+MB APK. The website's
+// compat-submission pipeline hashes the exact same raw APK bytes when a report
+// is submitted, so this lets a reviewer confirm the attached logs actually came
+// from the APK the report claims (see compat-reports' meta.json apk_sha256).
+static std::string apkSha256Cached(const std::string& apk_path, const std::string& base_dir) {
+    std::string cache_path = base_dir + "/.apk_sha256";
+    FILE* cf = fopen(cache_path.c_str(), "rb");
+    if (cf) {
+        char buf[65] = {0};
+        size_t n = fread(buf, 1, 64, cf);
+        fclose(cf);
+        if (n == 64) return std::string(buf, 64);
+    }
+    std::string hash = sha256File(apk_path);
+    if (!hash.empty()) {
+        FILE* wf = fopen(cache_path.c_str(), "wb");
+        if (wf) { fwrite(hash.data(), 1, hash.size(), wf); fclose(wf); }
+    }
+    return hash;
+}
+
 // ─── apkInstall ──────────────────────────────────────────────────────────────
 bool apkInstall(const std::string& apk_path, const std::string& pkg_name, ProgressCb cb) {
     std::string base_dir  = std::string("sdmc:/AndroidHorizonNX/games/") + pkg_name;
@@ -545,6 +589,18 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     mkdirp(base_dir);
     mkdirp(lib_dir);
     mkdirp(asset_dir);
+
+    {
+        std::string apkHash = apkSha256Cached(apk_path, base_dir);
+        if (!apkHash.empty())
+            compatLogFmt("launchApk: apk sha256=%s", apkHash.c_str());
+        else
+            compatLog("launchApk: apk sha256 unavailable (couldn't read the APK file)");
+    }
+
+    g_fps_cap_stored = readFpsCap(base_dir);
+    compatLogFmt("launchApk: fps cap=%s",
+                 g_fps_cap_stored > 0 ? std::to_string(g_fps_cap_stored).c_str() : "none (default)");
 
     // ── 2. Extract APK (skipped when already installed) ──────────────────────
     if (!already_installed) {
@@ -767,10 +823,18 @@ static volatile bool g_splash_active = true;
 void compatMarkSplashDone() { g_splash_active = false; }
 
 // See loader.h doc comment. Consumed once per frame in the game loop, which
-// sends a synthetic BACK key each frame while this is > 0.
+// sends a synthetic BACK key every kBackInjectPeriodFrames while this is > 0.
 static volatile int g_force_back_frames = 0;
+// A 2026-07-15 hardware test (compat-reports submission 2480fade) showed the
+// guard's own BACK spam causing the crash it exists to avoid: firing BACK
+// every single frame (60Hz) queues a second synthetic press while cocos2d-x
+// is still mid-transition popping the scene from the first, and the fault
+// landed in engine code within the same second the guard triggered — a race,
+// not the "known crash" this was written to dodge. Spacing presses out gives
+// each scene pop time to actually finish before the next one arrives.
+static constexpr int kBackInjectPeriodFrames = 15;  // ~250ms at 60fps
 void compatBlockShopEntry() {
-    g_force_back_frames = 90;  // ~1.5s at 60fps — several chances to register
+    g_force_back_frames = 90;  // ~1.5s at 60fps — 6 presses at the throttled rate below
     compatLog("iap-guard: trackPage looked like Shop/IAP — forcing BACK for ~1.5s");
 }
 
@@ -1397,8 +1461,17 @@ void runGameOnMainThread(void* game_so_ptr,
         // noise. Logging exactly which frame and how long it stopped for is
         // what actually tells us WHERE to spend future optimization effort
         // instead of guessing from "it feels stuttery sometimes".
-        static constexpr uint64_t kFrameStallMs       = 33;   // ~worse than 30fps for one frame
-        static constexpr uint64_t kFrameStallSevereMs = 100;  // ~worse than 10fps — a real freeze
+        // Target frame time for the optional per-APK cap (see
+        // g_fps_cap_stored/readFpsCap above) — 0 means uncapped/default,
+        // matching prior behavior exactly. The stall thresholds below widen
+        // to match an active cap so the intentional pacing sleep added below
+        // never logs itself as a "stall".
+        const uint64_t targetFrameMs      = g_fps_cap_stored > 0 ? (1000 / (uint64_t)g_fps_cap_stored) : 0;
+        const uint64_t kFrameStallMs      = std::max<uint64_t>(33, targetFrameMs + 5);
+        const uint64_t kFrameStallSevereMs = std::max<uint64_t>(100, targetFrameMs + 60);
+        if (targetFrameMs > 0)
+            compatLogFmt("perf: framerate capped to %dfps (~%llums/frame)",
+                         g_fps_cap_stored, (unsigned long long)targetFrameMs);
         uint64_t lastFrameTick = 0;
         while (appletMainLoop()) {
             // Recovery window covers the whole iteration (event poll, render,
@@ -1436,16 +1509,18 @@ void runGameOnMainThread(void* game_so_ptr,
                     }
                 }
 
-                // Shop guard: inject one synthetic BACK per frame while
-                // active, giving the game's own navigation many chances to
-                // process it and leave the Shop scene before whatever runs
-                // next has a chance to hit its known crash. Decrement
+                // Shop guard: inject one synthetic BACK every
+                // kBackInjectPeriodFrames while active (not every frame —
+                // see kBackInjectPeriodFrames' comment above), giving the
+                // game's own navigation time to actually leave the Shop
+                // scene before the next press arrives. Decrement
                 // unconditionally — if keyDown were ever null, tying the
                 // countdown to a successful call would swallow touch input
                 // (see the `continue` above) forever instead of just for
                 // this one window.
                 if (g_force_back_frames > 0) {
-                    if (keyDown) keyDown(env, obj, 4 /*AKEYCODE_BACK*/);
+                    if (keyDown && (g_force_back_frames % kBackInjectPeriodFrames) == 0)
+                        keyDown(env, obj, 4 /*AKEYCODE_BACK*/);
                     g_force_back_frames--;
                 }
 
@@ -1478,13 +1553,25 @@ void runGameOnMainThread(void* game_so_ptr,
                 else if (win)
                     SDL_GL_SwapWindow(win);
 
-                // Frame-stall detector — measured right after the swap so it
-                // covers the whole frame (event poll, nativeRender, overlay,
-                // swap) exactly once per iteration. Logged only past the
-                // threshold, so a smooth 60fps session stays silent; this is
-                // a genuinely rare event (not per-frame telemetry), so a real
-                // disk write per stall is fine — nothing like the earlier
-                // per-frame logging bugs this project already fixed.
+                // Optional per-APK frame pacing (see targetFrameMs above) —
+                // sleeps off whatever's left of the target frame time before
+                // the stall detector takes its measurement below, so a
+                // steady capped session reads as steady, not as a stall every
+                // single frame.
+                if (targetFrameMs > 0 && lastFrameTick != 0) {
+                    uint64_t elapsedMs = (armGetSystemTick() - lastFrameTick) * 1000 / armGetSystemTickFreq();
+                    if (elapsedMs < targetFrameMs)
+                        SDL_Delay((Uint32)(targetFrameMs - elapsedMs));
+                }
+
+                // Frame-stall detector — measured right after the swap (and
+                // the pacing sleep above, if any) so it covers the whole
+                // frame (event poll, nativeRender, overlay, swap) exactly
+                // once per iteration. Logged only past the threshold, so a
+                // smooth 60fps session stays silent; this is a genuinely rare
+                // event (not per-frame telemetry), so a real disk write per
+                // stall is fine — nothing like the earlier per-frame logging
+                // bugs this project already fixed.
                 {
                     uint64_t nowTick = armGetSystemTick();
                     if (lastFrameTick != 0) {
