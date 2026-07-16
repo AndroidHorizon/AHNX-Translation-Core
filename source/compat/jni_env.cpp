@@ -313,12 +313,148 @@ static jdouble  s_RetDoubleV(JNIEnv*, jobject, jmethodID, va_list) { return 0.0;
 static void     s_RetVoid(JNIEnv*, ...)   {}
 static void     s_RetVoidV(JNIEnv*, jobject, jmethodID, va_list) {}
 
-// ─── Instance-method call stubs ───────────────────────────────────────────────
-static jobject s_CallObjectMethod(JNIEnv*, jobject, jmethodID, ...) {
-    compatLog("JNI CallObjectMethod"); return (jobject)"";
+// ─── Static-method dispatching stubs ─────────────────────────────────────────
+// Helper: resolve a jmethodID to its MethodEntry (guards against DUMMY_METHOD)
+static inline MethodEntry* methodEntry(jmethodID mid) {
+    return (mid == (jmethodID)DUMMY_METHOD) ? nullptr : (MethodEntry*)mid;
 }
-static jobject s_CallObjectMethodV(JNIEnv*, jobject, jmethodID, va_list) {
-    compatLog("JNI CallObjectMethodV"); return (jobject)"";
+
+// ─── Android Java object model (Unity/IL2CPP first-frame reflection) ──────────
+// Unity's native core + IL2CPP come up without touching Java, but the first
+// frame reads config through Android reflection: Activity.getIntent,
+// Context.getAssets + AssetManager.open, PackageManager.getApplicationInfo,
+// Bundle, java.util.Scanner. The base JNI layer above returns dummy objects,
+// which strands those chains. Back the specific objects Unity touches with real
+// tagged handles so the calls return usable data — asset bytes from the
+// extracted APK, the real package name, filesystem paths. Everything dispatches
+// by METHOD NAME, so the cocos2d-x path (which never makes these calls) is
+// untouched: unknown method names fall through to the old dummy behavior.
+namespace {
+enum class JCls : uint8_t {
+    Generic, Activity, Intent, Bundle, AssetManager, InputStream,
+    PackageManager, AppInfo, Scanner, File
+};
+struct JavaObj {
+    JCls                 cls = JCls::Generic;
+    std::string          str;    // File path / package name / generic text
+    std::vector<uint8_t> data;   // InputStream / Scanner content
+    size_t               pos = 0;
+};
+static std::vector<JavaObj*> g_java_objs;  // few objects, leaked for process life
+
+static jobject jmake(JCls c, const std::string& s = "") {
+    JavaObj* o = new JavaObj();
+    o->cls = c; o->str = s;
+    g_java_objs.push_back(o);
+    return (jobject)o;
+}
+static JavaObj* jget(jobject o) {
+    for (JavaObj* j : g_java_objs) if ((jobject)j == o) return j;
+    return nullptr;  // not one of ours (a raw char* string, sentinel, or null)
+}
+static std::string dataDir() {
+    const char* base = compatGet()->activity.internalDataPath;
+    return base ? base : "";
+}
+static std::string packageName() {
+    // internalDataPath is .../games/<pkg>; the basename is the package id.
+    std::string d = dataDir();
+    size_t s = d.rfind('/');
+    return (s != std::string::npos) ? d.substr(s + 1) : d;
+}
+// AssetManager.open(rel) → an InputStream-tagged object holding the extracted
+// asset's bytes (assets live under <dataDir>/assets, unpacked from the APK).
+static jobject openAssetStream(const char* rel) {
+    JavaObj* o = new JavaObj(); o->cls = JCls::InputStream;
+    std::string path = dataDir() + "/assets/" + (rel ? rel : "");
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        if (n > 0) { o->data.resize((size_t)n); size_t rd = fread(o->data.data(), 1, (size_t)n, f); o->data.resize(rd); }
+        fclose(f);
+        compatLogFmt("JNI AssetManager.open(%s) → %zu bytes", rel ? rel : "?", o->data.size());
+    } else {
+        compatLogFmt("JNI AssetManager.open(%s) → not found (empty stream)", rel ? rel : "?");
+    }
+    g_java_objs.push_back(o);
+    return (jobject)o;
+}
+
+// Object-returning instance method dispatch, by method name. va_list is
+// positioned at the first Java argument.
+static jobject dispatchObjectMethod(jobject recv, MethodEntry* e, va_list args) {
+    if (!e) return (jobject)"";
+    const char* m = e->name;
+    JavaObj* self = jget(recv);
+
+    // Context / Activity graph
+    if (!strcmp(m, "getIntent"))           return jmake(JCls::Intent);
+    if (!strcmp(m, "getExtras"))           return jmake(JCls::Bundle);
+    if (!strcmp(m, "getAssets"))           return jmake(JCls::AssetManager);
+    if (!strcmp(m, "getPackageManager"))   return jmake(JCls::PackageManager);
+    if (!strcmp(m, "getApplicationInfo"))  return jmake(JCls::AppInfo);
+    if (!strcmp(m, "getApplicationContext") || !strcmp(m, "getBaseContext"))
+        return recv;
+    if (!strcmp(m, "getClassLoader"))      return jmake(JCls::Generic);
+    if (!strcmp(m, "getPackageName") || !strcmp(m, "getPackageCodePath"))
+        return (jobject)strdup(packageName().c_str());
+    if (!strcmp(m, "getFilesDir") || !strcmp(m, "getCacheDir") ||
+        !strcmp(m, "getExternalFilesDir") || !strcmp(m, "getExternalCacheDir") ||
+        !strcmp(m, "getObbDir") || !strcmp(m, "getDataDir"))
+        return jmake(JCls::File, dataDir());
+    if (!strcmp(m, "getAbsolutePath") || !strcmp(m, "getPath") ||
+        !strcmp(m, "getCanonicalPath"))
+        return (jobject)strdup(self ? self->str.c_str() : dataDir().c_str());
+    if (!strcmp(m, "toString"))
+        return (jobject)strdup(self ? self->str.c_str() : "");
+
+    // AssetManager.open(String) → InputStream
+    if (!strcmp(m, "open") || !strcmp(m, "openNonAssetFd") || !strcmp(m, "openFd")) {
+        const char* rel = (const char*)va_arg(args, void*);
+        return openAssetStream(rel);
+    }
+
+    // java.util.Scanner: useDelimiter is chainable; next/nextLine yield content.
+    if (!strcmp(m, "useDelimiter") || !strcmp(m, "reset")) return recv;
+    if (!strcmp(m, "next") || !strcmp(m, "nextLine")) {
+        if (self && self->cls == JCls::Scanner && self->pos < self->data.size()) {
+            std::string s((const char*)self->data.data() + self->pos,
+                          self->data.size() - self->pos);
+            self->pos = self->data.size();
+            return (jobject)strdup(s.c_str());
+        }
+        return (jobject)strdup("");
+    }
+
+    // Bundle getters return null (→ Unity falls back to its defaults).
+    if (!strcmp(m, "getString") || !strcmp(m, "get") || !strcmp(m, "getCharSequence"))
+        return nullptr;
+
+    compatLogFmt("JNI CallObjectMethodV: unhandled %s %s → \"\"", m, e->sig);
+    return (jobject)"";
+}
+
+static jboolean dispatchBoolMethod(jobject recv, MethodEntry* e, va_list) {
+    if (!e) return JNI_FALSE;
+    const char* m = e->name;
+    JavaObj* self = jget(recv);
+    if (!strcmp(m, "hasNext") || !strcmp(m, "hasNextLine"))
+        return (self && self->cls == JCls::Scanner && self->pos < self->data.size())
+               ? JNI_TRUE : JNI_FALSE;
+    // containsKey/getBoolean on our empty Bundles → false (Unity uses defaults).
+    return JNI_FALSE;
+}
+} // namespace
+
+// ─── Instance-method call stubs ───────────────────────────────────────────────
+static jobject s_CallObjectMethodV(JNIEnv*, jobject recv, jmethodID mid, va_list args) {
+    return dispatchObjectMethod(recv, methodEntry(mid), args);
+}
+static jobject s_CallObjectMethod(JNIEnv* env, jobject recv, jmethodID mid, ...) {
+    va_list ap; va_start(ap, mid);
+    jobject r = s_CallObjectMethodV(env, recv, mid, ap);
+    va_end(ap);
+    return r;
 }
 static void s_CallVoidMethod(JNIEnv*, jobject, jmethodID, ...) {
     compatLog("JNI CallVoidMethod");
@@ -326,8 +462,14 @@ static void s_CallVoidMethod(JNIEnv*, jobject, jmethodID, ...) {
 static void s_CallVoidMethodV(JNIEnv*, jobject, jmethodID, va_list) {
     compatLog("JNI CallVoidMethodV");
 }
-static jboolean s_CallBoolMethod(JNIEnv*, jobject, jmethodID, ...) {
-    compatLog("JNI CallBooleanMethod"); return JNI_FALSE;
+static jboolean s_CallBoolMethodV(JNIEnv*, jobject recv, jmethodID mid, va_list args) {
+    return dispatchBoolMethod(recv, methodEntry(mid), args);
+}
+static jboolean s_CallBoolMethod(JNIEnv* env, jobject recv, jmethodID mid, ...) {
+    va_list ap; va_start(ap, mid);
+    jboolean r = s_CallBoolMethodV(env, recv, mid, ap);
+    va_end(ap);
+    return r;
 }
 static jint s_CallIntMethod(JNIEnv*, jobject, jmethodID, ...) {
     compatLog("JNI CallIntMethod"); return 0;
@@ -335,14 +477,22 @@ static jint s_CallIntMethod(JNIEnv*, jobject, jmethodID, ...) {
 static jlong s_CallLongMethod(JNIEnv*, jobject, jmethodID, ...) {
     compatLog("JNI CallLongMethod"); return 0LL;
 }
-static jobject s_NewObject(JNIEnv*, jclass, jmethodID, ...) {
+// new Scanner(InputStream, charset) wraps the stream's bytes so next() can
+// return them; other constructors stay null (unchanged behavior).
+static jobject s_NewObject(JNIEnv*, jclass, jmethodID mid, ...) {
+    MethodEntry* e = methodEntry(mid);
+    if (e && strstr(e->sig, "Ljava/io/InputStream;")) {
+        va_list ap; va_start(ap, mid);
+        jobject isObj = (jobject)va_arg(ap, void*);
+        va_end(ap);
+        JavaObj* is = jget(isObj);
+        JavaObj* sc = new JavaObj(); sc->cls = JCls::Scanner;
+        if (is) sc->data = is->data;
+        g_java_objs.push_back(sc);
+        compatLogFmt("JNI new Scanner(InputStream) → %zu bytes", sc->data.size());
+        return (jobject)sc;
+    }
     compatLog("JNI NewObject"); return nullptr;
-}
-
-// ─── Static-method dispatching stubs ─────────────────────────────────────────
-// Helper: resolve a jmethodID to its MethodEntry (guards against DUMMY_METHOD)
-static inline MethodEntry* methodEntry(jmethodID mid) {
-    return (mid == (jmethodID)DUMMY_METHOD) ? nullptr : (MethodEntry*)mid;
 }
 
 static jint s_CallStaticIntMethodV(JNIEnv*, jclass, jmethodID mid, va_list args) {
@@ -872,7 +1022,7 @@ void jniSetup(CompatLayer* cl) {
     g_jni_funcs[36] = (void*)s_CallObjectMethod;
     // CallBooleanMethod 37-39
     g_jni_funcs[37] = (void*)s_CallBoolMethod;
-    g_jni_funcs[38] = (void*)s_RetBoolV;
+    g_jni_funcs[38] = (void*)s_CallBoolMethodV;
     g_jni_funcs[39] = (void*)s_CallBoolMethod;
     // CallByte/Char/ShortMethod 40-48
     for (int i = 40; i <= 48; i++) g_jni_funcs[i] = (void*)s_RetInt;
