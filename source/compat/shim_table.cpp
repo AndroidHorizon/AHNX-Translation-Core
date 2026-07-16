@@ -1063,6 +1063,147 @@ extern "C" {
 }
 static void stub_gnu_unwind_frame(void*, void*) {}
 
+// ─── Unity / IL2CPP unresolved-symbol gap fillers ─────────────────────────────
+// libunity.so + libil2cpp.so import a batch of Bionic libc / Android symbols
+// that our shim table didn't list, so the ELF loader poisoned them with
+// 0xBAD0BAD0BAD00000 — and the first libunity static constructor to touch one
+// (ctor 32, which indexed the poisoned `_ctype_` table) hard-faulted to the
+// Atmosphère screen. These provide safe implementations/stubs so those symbols
+// resolve instead of poisoning. Network/process ops are deliberately failed
+// (there is no networking or multi-process on this target, same posture as the
+// existing socket stubs); filesystem ops fail gracefully; profiling markers are
+// no-ops. Signatures are approximate C-ABI — extra register args are harmless.
+
+// _ctype_: Bionic's ctype classification table, referenced directly by inlined
+// isX()/toX() macros in Unity/IL2CPP. It's indexed `_ctype_[c+1]` for a byte c,
+// so the symbol address must point at the "EOF slot", one before the byte-0
+// entry. We over-allocate 128 bytes of zeros on each side so a stray signed-
+// char index (the exact thing that faulted at poison-4) lands in mapped,
+// zeroed memory instead of crashing.
+static unsigned char g_ctype_storage[128 + 1 + 256 + 128];
+static const unsigned char* g_ctype_base = nullptr;  // points at the [c+1]=EOF slot
+struct CtypeInit {
+    CtypeInit() {
+        // Bit flags match Bionic/BSD <ctype.h>: _U _L _N _S _P _C _X _B.
+        enum { _CU=0x01,_CL=0x02,_CN=0x04,_CS=0x08,_CP=0x10,_CC=0x20,_CX=0x40,_CB=0x80 };
+        unsigned char* t = g_ctype_storage + 128;  // t[0] = EOF slot, t[c+1] = byte c
+        for (int c = 0; c < 256; c++) {
+            unsigned char f = 0;
+            if (c >= 'A' && c <= 'Z') f |= _CU;
+            if (c >= 'a' && c <= 'z') f |= _CL;
+            if (c >= '0' && c <= '9') f |= _CN;
+            if (c == ' ' || (c >= '\t' && c <= '\r')) f |= _CS;
+            if (c == ' ') f |= _CB;
+            if ((c>='!'&&c<='/')||(c>=':'&&c<='@')||(c>='['&&c<='`')||(c>='{'&&c<='~')) f |= _CP;
+            if (c < 0x20 || c == 0x7f) f |= _CC;
+            if ((c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f')) f |= _CX;
+            t[c + 1] = f;
+        }
+        g_ctype_base = t;  // _ctype_ symbol resolves here
+    }
+};
+static CtypeInit g_ctype_init;
+// Resolved lazily in shimResolve so the static-init ordering can't hand back a
+// null base (see the _ctype_ special-case there).
+
+// ── string / memory ──
+static char* stub_strdup(const char* s) {
+    if (!s) return nullptr;
+    size_t n = strlen(s) + 1;
+    char* p = (char*)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+static char* stub_strsep(char** stringp, const char* delim) {
+    char* s = stringp ? *stringp : nullptr;
+    if (!s) return nullptr;
+    char* p = s + strcspn(s, delim);
+    if (*p) { *p = '\0'; *stringp = p + 1; } else { *stringp = nullptr; }
+    return s;
+}
+static size_t stub_strlcpy(char* dst, const char* src, size_t size) {
+    size_t sl = strlen(src);
+    if (size) { size_t n = (sl >= size) ? size - 1 : sl; memcpy(dst, src, n); dst[n] = '\0'; }
+    return sl;
+}
+
+// ── math ──
+static float  stub_isnanf(float x)  { return x != x; }
+static double stub_remainder(double x, double y) { return remainder(x, y); }
+typedef struct { int quot; int rem; } stub_div_t;
+static stub_div_t stub_div(int n, int d) { stub_div_t r; r.quot = d ? n/d : 0; r.rem = d ? n%d : 0; return r; }
+
+// ── filesystem (fail gracefully; nothing here needs them to succeed) ──
+static int  stub_unlink(const char*)             { errno = EROFS; return -1; }
+static int  stub_rmdir(const char*)              { errno = EROFS; return -1; }
+static int  stub_truncate(const char*, long)     { errno = EROFS; return -1; }
+static int  stub_ftruncate(int, long)            { errno = EROFS; return -1; }
+static long stub_lseek64(int fd, long off, int w){ return lseek(fd, off, w); }
+static int  stub_flock(int, int)                 { return 0; }
+static int  stub_utime(const char*, const void*) { return 0; }
+static int  stub_statfs(const char*, void* buf)  { if (buf) memset(buf, 0, 64); return 0; }
+static int  stub_fscanf(FILE*, const char*, ...) { return -1; /* EOF */ }
+static int  stub_tcflush(int, int)               { return 0; }
+
+// ── process / scheduling / signals (single-process, no ptrace) ──
+static int    stub_getpriority(int, int)         { return 0; }
+static int    stub_setpriority(int, int, int)    { return 0; }
+static long   stub_ptrace(int, ...)              { errno = EPERM; return -1; }
+static int    stub_getpagesize(void)             { return 0x1000; }
+static void*  stub_getpwuid(unsigned)            { return nullptr; }
+static int    stub_sigsuspend(const void*)       { errno = EINTR; return -1; }
+static int    stub_clock_getres(int, struct timespec* ts) { if (ts) { ts->tv_sec = 0; ts->tv_nsec = 1; } return 0; }
+static int    stub_uname(void* buf)              { if (buf) memset(buf, 0, 6 * 65); return 0; }
+static int    stub_madvise(void*, size_t, int)   { return 0; }
+
+// ── pthread extras ──
+static void   stub_pthread_exit(void*)                 { while (true) svcSleepThread(1000000000ULL); }
+static int    stub_pthread_atfork(void*, void*, void*) { return 0; }
+static int    stub_pthread_getattr_np(void*, void*)    { return 0; }
+static int    stub_pthread_condattr_init(void*)        { return 0; }
+static int    stub_pthread_condattr_destroy(void*)     { return 0; }
+static int    stub_pthread_condattr_setclock(void*, int) { return 0; }
+static int    stub_sem_getvalue(void*, int* v)         { if (v) *v = 0; return 0; }
+
+// ── networking (no network on this target — fail like the existing socket stubs) ──
+static unsigned long stub_inet_addr(const char*)                 { return 0xFFFFFFFFUL; }
+static const char*   stub_inet_ntop(int, const void*, char* dst, unsigned) { if (dst) dst[0] = '\0'; return dst; }
+static int           stub_inet_pton(int, const char*, void*)     { return 0; }
+static int           stub_getaddrinfo(const char*, const char*, const void*, void** res) { if (res) *res = nullptr; return -2; /* EAI_NONAME */ }
+static void          stub_freeaddrinfo(void*)                    {}
+static int           stub_getnameinfo(const void*, unsigned, char*, unsigned, char*, unsigned, int) { return -2; }
+static int           stub_gethostname(char* n, size_t l)         { if (n && l) { strncpy(n, "switch", l - 1); n[l-1] = '\0'; } return 0; }
+static void*         stub_gethostbyaddr(const void*, int, int)   { return nullptr; }
+static long          stub_recvfrom(int, void*, size_t, int, void*, void*) { errno = ENOTCONN; return -1; }
+static long          stub_recvmsg(int, void*, int)               { errno = ENOTCONN; return -1; }
+static long          stub_sendmsg(int, const void*, int)         { errno = ENOTCONN; return -1; }
+static int           stub_shutdown(int, int)                     { return 0; }
+
+// ── Android platform ──
+static int   stub_system_property_get(const char*, char* value) { if (value) value[0] = '\0'; return 0; }
+static void* stub_ANativeWindow_fromSurface(void*, void*)        { return &compatGet()->window; }
+static int   stub_ASensorEventQueue_hasEvents(void*)            { return 0; }
+static void  stub_google_region(void)                           {}  // profiling markers — no-op
+
+// ── wide char extras ──
+static unsigned stub_wctype(const char*)             { return 0; }
+static int      stub_iswctype(unsigned, unsigned)    { return 0; }
+static size_t   stub_wcsftime(wchar_t* s, size_t m, const wchar_t*, const void*) { if (m) s[0] = 0; return 0; }
+
+// I/O vector write — implement over the existing fd write path.
+static long stub_writev(int fd, const void* iov_in, int cnt) {
+    struct IoVec { void* base; size_t len; };
+    const IoVec* iov = (const IoVec*)iov_in;
+    long total = 0;
+    for (int i = 0; i < cnt; i++) {
+        long n = write(fd, iov[i].base, iov[i].len);
+        if (n < 0) return total ? total : -1;
+        total += n;
+        if ((size_t)n < iov[i].len) break;
+    }
+    return total;
+}
+
 // ─── Shim table ──────────────────────────────────────────────────────────────
 struct ShimEntry { const char* name; void* ptr; };
 
@@ -1890,6 +2031,62 @@ static const ShimEntry g_shims[] = {
     // string extras that newlib provides but weren't forwarded
     {"strspn",          (void*)strspn},
 
+    // ── Unity / IL2CPP gap fillers (see the stub block above) ─────────────────
+    // _ctype_ is handled specially in shimResolve (its address is the table).
+    {"strdup",          (void*)stub_strdup},
+    {"strsep",          (void*)stub_strsep},
+    {"strlcpy",         (void*)stub_strlcpy},
+    {"__isnanf",        (void*)stub_isnanf},
+    {"remainder",       (void*)stub_remainder},
+    {"div",             (void*)stub_div},
+    {"unlink",          (void*)stub_unlink},
+    {"rmdir",           (void*)stub_rmdir},
+    {"truncate",        (void*)stub_truncate},
+    {"ftruncate",       (void*)stub_ftruncate},
+    {"lseek64",         (void*)stub_lseek64},
+    {"flock",           (void*)stub_flock},
+    {"utime",           (void*)stub_utime},
+    {"statfs",          (void*)stub_statfs},
+    {"fscanf",          (void*)stub_fscanf},
+    {"tcflush",         (void*)stub_tcflush},
+    {"getpriority",     (void*)stub_getpriority},
+    {"setpriority",     (void*)stub_setpriority},
+    {"ptrace",          (void*)stub_ptrace},
+    {"getpagesize",     (void*)stub_getpagesize},
+    {"getpwuid",        (void*)stub_getpwuid},
+    {"sigsuspend",      (void*)stub_sigsuspend},
+    {"clock_getres",    (void*)stub_clock_getres},
+    {"uname",           (void*)stub_uname},
+    {"madvise",         (void*)stub_madvise},
+    {"pthread_exit",            (void*)stub_pthread_exit},
+    {"pthread_atfork",          (void*)stub_pthread_atfork},
+    {"pthread_getattr_np",      (void*)stub_pthread_getattr_np},
+    {"pthread_condattr_init",   (void*)stub_pthread_condattr_init},
+    {"pthread_condattr_destroy",(void*)stub_pthread_condattr_destroy},
+    {"pthread_condattr_setclock",(void*)stub_pthread_condattr_setclock},
+    {"sem_getvalue",    (void*)stub_sem_getvalue},
+    {"inet_addr",       (void*)stub_inet_addr},
+    {"inet_ntop",       (void*)stub_inet_ntop},
+    {"inet_pton",       (void*)stub_inet_pton},
+    {"getaddrinfo",     (void*)stub_getaddrinfo},
+    {"freeaddrinfo",    (void*)stub_freeaddrinfo},
+    {"getnameinfo",     (void*)stub_getnameinfo},
+    {"gethostname",     (void*)stub_gethostname},
+    {"gethostbyaddr",   (void*)stub_gethostbyaddr},
+    {"recvfrom",        (void*)stub_recvfrom},
+    {"recvmsg",         (void*)stub_recvmsg},
+    {"sendmsg",         (void*)stub_sendmsg},
+    {"shutdown",        (void*)stub_shutdown},
+    {"__system_property_get",   (void*)stub_system_property_get},
+    {"ANativeWindow_fromSurface",(void*)stub_ANativeWindow_fromSurface},
+    {"ASensorEventQueue_hasEvents",(void*)stub_ASensorEventQueue_hasEvents},
+    {"__google_potentially_blocking_region_begin",(void*)stub_google_region},
+    {"__google_potentially_blocking_region_end",  (void*)stub_google_region},
+    {"wctype",          (void*)stub_wctype},
+    {"iswctype",        (void*)stub_iswctype},
+    {"wcsftime",        (void*)stub_wcsftime},
+    {"writev",          (void*)stub_writev},
+
     // sentinel
     {nullptr, nullptr}
 };
@@ -1899,6 +2096,10 @@ static constexpr size_t NUM_SHIMS = sizeof(g_shims)/sizeof(g_shims[0]) - 1;
 // ─── shimResolve — linear scan (fast enough for N < 400) ──────────────────────
 void* shimResolve(const char* name) {
     if (!name) return nullptr;
+    // _ctype_ is a data symbol whose ADDRESS is the classification table (built
+    // at static init) — hand back the [c+1]=EOF base pointer, not a function.
+    if (strcmp(name, "_ctype_") == 0)
+        return (void*)(g_ctype_base ? g_ctype_base : g_ctype_storage + 128);
     for (size_t i = 0; i < NUM_SHIMS; i++) {
         if (strcmp(g_shims[i].name, name) == 0)
             return g_shims[i].ptr;
