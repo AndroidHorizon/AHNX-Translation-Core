@@ -642,11 +642,31 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
         if (g_compat_log) { logFlushDedup(); fclose(g_compat_log); g_compat_log = nullptr; }
         return result;
     }
+    bool sawIl2cpp = false, sawUnity = false;
     for (auto& [sz, path] : all_sos) {
         size_t sl = path.rfind('/');
         const char* nm = (sl != std::string::npos) ? path.c_str() + sl + 1 : path.c_str();
         compatLogFmt("findAllSos: %s (%zu bytes)", nm, sz);
+        if (strcmp(nm, "libil2cpp.so") == 0) sawIl2cpp = true;
+        if (strcmp(nm, "libunity.so")  == 0) sawUnity  = true;
     }
+
+    // Engine detection. Unity (libunity.so + IL2CPP) is a completely different
+    // native runtime from the cocos2d-x games this Core drives directly — it
+    // boots through libmain.so's JNI_OnLoad → NativeLoader.load → dlopen of
+    // libunity, then registers its game loop dynamically via RegisterNatives.
+    // The Unity-specific bringup lives in the separate AHNX-Unity-Runtime
+    // module (see unityIsGame/unityRun); everything below stays the cocos2d-x
+    // path. Runtime deps that Unity dlopen's on demand need a real dlopen —
+    // point it at this game's lib dir.
+    elfSetDlopenDir(lib_dir.c_str());
+    const bool isUnity = sawUnity || sawIl2cpp;
+    if (isUnity)
+        compatLog("engine: Unity IL2CPP detected (libunity.so/libil2cpp.so) — "
+                  "routing to AHNX-Unity-Runtime bringup");
+    else
+        compatLog("engine: cocos2d-x / generic NDK path");
+
     // Main SO is largest (last in smallest-first vector)
     const std::string& main_so = all_sos.back().second;
 

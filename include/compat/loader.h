@@ -161,6 +161,14 @@ CompatLayer* compatGet();
 
 // Load a single .so from disk — does NOT run constructors (call elfRunCtors after)
 LoadedSo*    elfLoad(const char* path, ProgressCb cb = nullptr);
+// Find an already-loaded .so by its basename (e.g. "libunity.so"), or nullptr.
+LoadedSo*    elfFindLoaded(const char* basename);
+// Backs a real dlopen(): returns the already-loaded .so with this basename, or
+// loads it on demand from the game's lib dir (set via elfSetDlopenDir). Runs its
+// constructors too, matching real dlopen semantics. Returns nullptr on failure.
+LoadedSo*    elfDlopen(const char* name);
+// Directory real-dlopen() searches when a requested lib isn't already loaded.
+void         elfSetDlopenDir(const char* lib_dir);
 // Reset accumulated unresolved-symbol count and JIT error code (call before loading a batch)
 void         elfResetCounts();
 // Run a loaded SO's DT_INIT_ARRAY constructors. cb (optional) is called periodically

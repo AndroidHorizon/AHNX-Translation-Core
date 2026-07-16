@@ -541,13 +541,31 @@ static int pt_attr_getstacksize(const void*, size_t* s) { if (s) *s = 65536; ret
 // ─── errno access (Bionic uses __errno() function) ───────────────────────────
 static int* bionic_errno(void) { return &errno; }
 
-// ─── dlopen / dlsym stubs ────────────────────────────────────────────────────
+// ─── dlopen / dlsym ──────────────────────────────────────────────────────────
+// Real, ELF-loader-backed (see elfDlopen). A dlopen handle IS the LoadedSo*, so
+// dlsym(handle, name) resolves against that specific library — which is what
+// Unity's NativeLoader.load → dlopen("libunity.so") + dlsym(...) chain needs.
+// A null/RTLD_DEFAULT handle falls back to the global shim + cross-library
+// resolver, preserving the old behavior for games that dlsym without a handle.
 static void* fake_dlopen(const char* path, int) {
-    compatLogFmt("dlopen: %s", path ? path : "(null)");
-    return (void*)0xDEAD;  // non-null means "success"
+    if (!path) return nullptr;
+    LoadedSo* so = elfDlopen(path);
+    if (so) return (void*)so;
+    // Unknown library: hand back a non-null sentinel so callers that only
+    // null-check the handle still proceed, and route their dlsym through the
+    // global resolver (old behavior) rather than hard-failing the load.
+    compatLogFmt("dlopen: %s not resolvable to a loaded .so — sentinel handle", path);
+    return (void*)0xDEAD;
 }
-static void* fake_dlsym(void*, const char* sym) {
-    // Recurse into our own shim table
+static void* fake_dlsym(void* handle, const char* sym) {
+    if (!sym) return nullptr;
+    // Handle-scoped lookup when dlopen returned a real LoadedSo*.
+    if (handle && handle != (void*)0xDEAD) {
+        void* p = ((LoadedSo*)handle)->findSym(sym);
+        if (p) return p;
+        // Fall through to the global resolver — Unity libs reference plenty of
+        // libc/GLES symbols our shim table owns, not just their own exports.
+    }
     void* p = shimResolve(sym);
     if (!p) compatLogFmt("dlsym: unresolved %s", sym ? sym : "?");
     return p;

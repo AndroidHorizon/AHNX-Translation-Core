@@ -335,6 +335,56 @@ static void* resolveSymbol(const char* name) {
     return nullptr;
 }
 
+// ─── Real dlopen/dlsym backing ─────────────────────────────────────────────────
+// Games that load their own native deps at runtime (Unity's NativeLoader.load
+// → dlopen("libunity.so"), GPG, etc.) go through libdl, which our shim table
+// routes here instead of the fake 0xDEAD stub. We back it with the same ELF
+// loader + loaded-so registry used for the initial batch.
+static std::string g_dlopen_dir;
+
+void elfSetDlopenDir(const char* lib_dir) {
+    g_dlopen_dir = lib_dir ? lib_dir : "";
+}
+
+static const char* baseName(const char* path) {
+    const char* s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+
+LoadedSo* elfFindLoaded(const char* basename) {
+    if (!basename) return nullptr;
+    for (LoadedSo* so : g_loaded_sos)
+        if (strcmp(baseName(so->path.c_str()), basename) == 0) return so;
+    return nullptr;
+}
+
+LoadedSo* elfDlopen(const char* name) {
+    if (!name || !name[0]) return nullptr;
+    const char* bn = baseName(name);
+
+    // Already loaded (part of the initial batch, or an earlier dlopen)?
+    if (LoadedSo* existing = elfFindLoaded(bn)) {
+        compatLogFmt("dlopen: %s already loaded → %p", bn, (void*)existing);
+        return existing;
+    }
+
+    if (g_dlopen_dir.empty()) {
+        compatLogFmt("dlopen: %s not loaded and no dlopen dir set — failing", bn);
+        return nullptr;
+    }
+    std::string path = g_dlopen_dir + "/" + bn;
+    compatLogFmt("dlopen: loading %s on demand from %s", bn, path.c_str());
+    LoadedSo* so = elfLoad(path.c_str(), nullptr);
+    if (!so) {
+        compatLogFmt("dlopen: elfLoad failed for %s", path.c_str());
+        return nullptr;
+    }
+    // Real dlopen runs the library's constructors before returning.
+    elfRunCtors(so, nullptr);
+    compatLogFmt("dlopen: %s loaded + ctors run → %p", bn, (void*)so);
+    return so;
+}
+
 // ─── ADRP data-segment redirect ───────────────────────────────────────────────
 // Scans code_buf (the writable copy of the code segment, size code_size words),
 // finds ADRP instructions whose natural runtime target falls in the phantom data
