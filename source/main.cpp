@@ -19,8 +19,8 @@
 
 extern void compatLogFmt(const char* fmt, ...);
 
-static const char* APK_DIR  = "sdmc:/AndroidHorizonNX/apks";
-static const char* LOG_FILE = "sdmc:/AndroidHorizonNX/log.txt";
+static const char* APK_DIR  = "sdmc:/Viridite/apks";
+static const char* LOG_FILE = "sdmc:/Viridite/log.txt";
 
 // ---------------------------------------------------------------------------
 // Layout (1280×720)
@@ -151,16 +151,16 @@ struct App {
     std::string noticeText = "One game session per launch for now — restart Viridite to play again";
 
     // Save the composed frame (call just before SDL_RenderPresent) as a PNG in
-    // sdmc:/AndroidHorizonNX/screenshots/ — showcase material for the README.
+    // sdmc:/Viridite/screenshots/ — showcase material for the README.
     void saveScreenshot(const char* name) {
-        mkdir("sdmc:/AndroidHorizonNX/screenshots", 0777);
+        mkdir("sdmc:/Viridite/screenshots", 0777);
         SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(
             0, SW, SH, 32, SDL_PIXELFORMAT_ABGR8888);
         if (!s) return;
         if (SDL_RenderReadPixels(rdr, nullptr, s->format->format,
                                  s->pixels, s->pitch) == 0) {
             char path[128];
-            snprintf(path, sizeof(path), "sdmc:/AndroidHorizonNX/screenshots/%s", name);
+            snprintf(path, sizeof(path), "sdmc:/Viridite/screenshots/%s", name);
             if (IMG_SavePNG(s, path) == 0) logMsg(path);
         }
         SDL_FreeSurface(s);
@@ -200,7 +200,7 @@ struct App {
 
     // ------------------------------------------------------------------
     bool init() {
-        mkdir("sdmc:/AndroidHorizonNX", 0777);
+        mkdir("sdmc:/Viridite", 0777);
         logOpen();
         logMsg("Viridite starting");
         socketInitializeDefault();
@@ -498,7 +498,7 @@ struct App {
 
         if (apks.empty()) {
             drawText(fSm,
-                "No APKs found — place .apk files in sdmc:/AndroidHorizonNX/apks/",
+                "No APKs found — place .apk files in sdmc:/Viridite/apks/",
                 C_GRAY, 30, LIST_Y + 30);
         } else {
             // Focus card (borealis-style): eased position + pulsing green glow,
@@ -747,7 +747,7 @@ struct App {
             y += 60;
         }
 
-        drawFooterBar({}, "Please wait — sdmc:/AndroidHorizonNX/compat_log.txt");
+        drawFooterBar({}, "Please wait — sdmc:/Viridite/compat_log.txt");
 
         if (!shotLoading && g_ui_pct >= 40) {  // mid-load with a lively log box
             shotLoading = true;
@@ -815,7 +815,7 @@ struct App {
         // If game loaded OK, run it here on the main thread (SDL2's EGL context
         // is current on this thread, so GL calls reach the screen).
         if (ctx.result.game_so) {
-            std::string base_dir = std::string("sdmc:/AndroidHorizonNX/games/") + pkg;
+            std::string base_dir = std::string("sdmc:/Viridite/games/") + pkg;
             runGameOnMainThread(ctx.result.game_so, win, ctx.apk_path, base_dir);
             gameRanOnce = true;
         }
@@ -898,7 +898,7 @@ struct App {
                          C_GRAY, 60, y); y += 28;
             }
             y += 8;
-            drawText(fSm, "Full log: sdmc:/AndroidHorizonNX/compat_log.txt", C_DIM, 60, y);
+            drawText(fSm, "Full log: sdmc:/Viridite/compat_log.txt", C_DIM, 60, y);
 
             drawFooterBar({{BG(GLYPH_B, "B"), "Back to menu"}, {BG(GLYPH_PLUS, "+"), "Menu"}});
 

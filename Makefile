@@ -10,7 +10,7 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-TARGET		:=	AHNX-Translation-Core-x64
+TARGET		:=	Viridite-Translation-Core-x64
 BUILD		:=	build
 SOURCES		:=	source source/compat unity-runtime/src
 DATA		:=	data

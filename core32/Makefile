@@ -14,7 +14,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 # build (same toolchain as everything else here) that just displays an
 # explanation; it is NOT the eventual real 32-bit engine, which would need an
 # entirely different (currently unavailable) toolchain to build for real.
-TARGET		:=	AHNX-Translation-Core-x32
+TARGET		:=	Viridite-Translation-Core-x32
 BUILD		:=	build
 SOURCES		:=	source
 INCLUDES	:=	include

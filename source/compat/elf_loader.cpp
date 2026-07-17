@@ -236,7 +236,7 @@ void elfDescribePc(uint64_t pc, char* buf, size_t sz) {
     }
     // Host code: anchor the address against a known host symbol so it can be
     // resolved offline against the build's .elf:
-    //   nm AndroidHorizonNX.elf | grep ' compatLog$'  → elf_addr
+    //   nm Viridite-Translation-Core-x64.elf | grep ' compatLog$'  → elf_addr
     //   fault_elf_addr = elf_addr + delta
     extern void compatLog(const char*);
     long long d = (long long)pc - (long long)(uintptr_t)&compatLog;

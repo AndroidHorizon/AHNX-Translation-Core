@@ -2,7 +2,7 @@
 #include "compat/android.h"
 #include "compat/sha256.h"
 #include "build_number.h"
-#include "unity/unity_runtime.h"   // AHNX-Unity-Runtime submodule
+#include "unity/unity_runtime.h"   // VNX-Unity-Runtime submodule
 #include <switch.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
@@ -554,7 +554,7 @@ static std::string apkSha256Cached(const std::string& apk_path, const std::strin
 
 // ─── apkInstall ──────────────────────────────────────────────────────────────
 bool apkInstall(const std::string& apk_path, const std::string& pkg_name, ProgressCb cb) {
-    std::string base_dir  = std::string("sdmc:/AndroidHorizonNX/games/") + pkg_name;
+    std::string base_dir  = std::string("sdmc:/Viridite/games/") + pkg_name;
     mkdirp(base_dir);
     mkdirp(base_dir + "/lib/");
     mkdirp(base_dir + "/assets/");
@@ -578,7 +578,7 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
                        ProgressCb cb, bool already_installed) {
     LaunchResult result;
 
-    std::string log_path = "sdmc:/AndroidHorizonNX/compat_log.txt";
+    std::string log_path = "sdmc:/Viridite/compat_log.txt";
     g_compat_log = fopen(log_path.c_str(), "w");
     g_log_start_t = armGetSystemTick();
     logEnvironmentHeader();
@@ -604,7 +604,7 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     }
 
     // ── 1. Set up directories (always, mkdirp is idempotent) ─────────────────
-    std::string base_dir  = std::string("sdmc:/AndroidHorizonNX/games/") + pkg_name;
+    std::string base_dir  = std::string("sdmc:/Viridite/games/") + pkg_name;
     std::string lib_dir   = base_dir + "/lib";
     std::string asset_dir = base_dir + "/assets";
     mkdirp(base_dir);
@@ -676,7 +676,7 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     // native runtime from the cocos2d-x games this Core drives directly — it
     // boots through libmain.so's JNI_OnLoad → NativeLoader.load → dlopen of
     // libunity, then registers its game loop dynamically via RegisterNatives.
-    // The Unity-specific bringup lives in the separate AHNX-Unity-Runtime
+    // The Unity-specific bringup lives in the separate VNX-Unity-Runtime
     // module (see unityIsGame/unityRun); everything below stays the cocos2d-x
     // path. Runtime deps that Unity dlopen's on demand need a real dlopen —
     // point it at this game's lib dir.
@@ -684,7 +684,7 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     const bool isUnity = sawUnity || sawIl2cpp;
     if (isUnity)
         compatLog("engine: Unity IL2CPP detected (libunity.so/libil2cpp.so) — "
-                  "routing to AHNX-Unity-Runtime bringup");
+                  "routing to VNX-Unity-Runtime bringup");
     else
         compatLog("engine: cocos2d-x / generic NDK path");
 
@@ -1335,7 +1335,7 @@ void runGameOnMainThread(void* game_so_ptr,
 
     // ── Unity IL2CPP games take a completely different path ─────────────────
     // Detected by libunity.so being loaded (see engine detection in launchApk).
-    // Hand off to the AHNX-Unity-Runtime submodule, which reproduces Unity's
+    // Hand off to the VNX-Unity-Runtime submodule, which reproduces Unity's
     // native boot from here. It runs on this main thread with the GL context
     // current, same as the cocos2d-x loop below. When it returns we're done —
     // the diagnostics are in compat_log.txt.
