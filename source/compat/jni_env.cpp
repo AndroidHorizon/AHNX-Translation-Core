@@ -40,6 +40,12 @@ static MethodEntry g_method_pool[512];
 static int g_method_count = 0;
 static std::unordered_map<std::string, MethodEntry*> g_method_index;
 
+// The Android Java object model (Unity first-frame reflection) is Unity-only.
+// Declared up here so GetFieldID/GetObjectField can consult it; the model
+// stays fully dormant for cocos2d-x games, whose JNI path is unchanged. Set by
+// jniSetUnityMode().
+static bool g_unity_mode = false;
+
 static MethodEntry* lookupOrCreateMethod(const char* n, const char* sg) {
     std::string key = std::string(n ? n : "") + "|" + (sg ? sg : "");
     auto it = g_method_index.find(key);
@@ -290,6 +296,14 @@ static jmethodID s_GetStaticMethodID(JNIEnv*, jclass, const char* n, const char*
 static jfieldID s_GetFieldID(JNIEnv*, jclass, const char* n, const char* sg) {
     if (logOnce("GetFieldID", n, sg))
         compatLogFmt("JNI GetFieldID: %s %s", n ? n : "?", sg ? sg : "?");
+    // Unity needs to read named fields (ApplicationInfo.metaData) — return an
+    // entry that encodes the name so GetObjectField can dispatch on it. The
+    // MethodEntry pool doubles as the field-name store (name+sig is all we
+    // need). Cocos2d-x games keep the old opaque DUMMY_FIELD, unchanged.
+    if (g_unity_mode) {
+        MethodEntry* e = lookupOrCreateMethod(n, sg);
+        if (e) return (jfieldID)e;
+    }
     return DUMMY_FIELD;
 }
 static jfieldID s_GetStaticFieldID(JNIEnv*, jclass, const char* n, const char* sg) {
@@ -341,12 +355,6 @@ struct JavaObj {
     size_t               pos = 0;
 };
 static std::vector<JavaObj*> g_java_objs;  // few objects, leaked for process life
-
-// The Android Java object model is Unity-only. It stays completely dormant for
-// cocos2d-x games (Hill Climb Racing etc.), whose CallObjectMethodV keeps its
-// original dummy behavior — so this can never change a working game's JNI path.
-// Set by jniSetUnityMode() from the Unity runtime before it drives initJni.
-static bool g_unity_mode = false;
 
 // strdup isn't exposed under -std=c++17 (newlib hides POSIX extensions), so
 // roll our own. The result is handed back as a jstring (a char* in this layer);
@@ -861,7 +869,17 @@ static jobject s_CallStaticObjectMethod(JNIEnv* env, jclass cls, jmethodID mid, 
 }
 
 // Fields (get/set)
-static jobject  s_GetObjField(JNIEnv*, jobject, jfieldID) { return nullptr; }
+static jobject  s_GetObjField(JNIEnv*, jobject, jfieldID fid) {
+    // Unity reads ApplicationInfo.metaData (a Bundle of manifest <meta-data>).
+    // Hand back a real empty Bundle so its getString/containsKey calls resolve
+    // to sane empties and Unity proceeds with defaults, instead of a null it
+    // stalls/NPEs on. Field name comes from the GetFieldID entry above.
+    if (g_unity_mode && (void*)fid != DUMMY_FIELD && fid) {
+        const char* fname = ((MethodEntry*)fid)->name;
+        if (!strcmp(fname, "metaData")) return jmake(JCls::Bundle);
+    }
+    return nullptr;
+}
 static jboolean s_GetBoolField(JNIEnv*, jobject, jfieldID){ return JNI_FALSE; }
 static jbyte    s_GetByteField(JNIEnv*, jobject, jfieldID){ return 0; }
 static jchar    s_GetCharField(JNIEnv*, jobject, jfieldID){ return 0; }
