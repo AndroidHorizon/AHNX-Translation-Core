@@ -183,8 +183,11 @@ void         compatUiLog(const char* msg);
 void         compatUiSetPct(int pct);
 // First JIT failure code since last elfResetCounts() call (0 = all OK)
 uint32_t     elfGetLastSvcPermCode();
-// Resolve a symbol across all loaded .so files, then shim table
+// Resolve a symbol against the override shim table (checked before game libs).
 void*        shimResolve(const char* name);
+// Fallback shim resolver (Unity/IL2CPP libc gap fillers) — checked AFTER game
+// libraries so it never shadows a game that ships its own copies (e.g. HCR).
+void*        shimResolveFallback(const char* name);
 
 // Find the nearest symbol at or before `vaddr` (ELF virtual address) in `so`.
 // Writes "symbol+0x<offset>" (or "0x<vaddr>" if none found) into buf[sz].
@@ -211,6 +214,11 @@ void*        compatFindGameSym(const char* name);
 // method name, e.g. "nativeRender"). Unity/IL2CPP register their whole player
 // API this way instead of exporting Java_ symbols. Returns the fn ptr or null.
 void*        jniFindRegisteredNative(const char* name);
+
+// Enable the Unity-only Android Java object model (see jni_env.cpp). Off by
+// default; the Unity runtime turns it on before driving initJni so cocos2d-x
+// games are completely unaffected.
+void         jniSetUnityMode(bool on);
 
 // Normal (mutex-serialized, dedup'd) logger to compat_log.txt. compatLog
 // writes one line; compatLogFmt is printf-style; compatLogFlush forces the

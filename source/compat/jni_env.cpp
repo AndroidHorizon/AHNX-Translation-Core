@@ -342,6 +342,12 @@ struct JavaObj {
 };
 static std::vector<JavaObj*> g_java_objs;  // few objects, leaked for process life
 
+// The Android Java object model is Unity-only. It stays completely dormant for
+// cocos2d-x games (Hill Climb Racing etc.), whose CallObjectMethodV keeps its
+// original dummy behavior — so this can never change a working game's JNI path.
+// Set by jniSetUnityMode() from the Unity runtime before it drives initJni.
+static bool g_unity_mode = false;
+
 // strdup isn't exposed under -std=c++17 (newlib hides POSIX extensions), so
 // roll our own. The result is handed back as a jstring (a char* in this layer);
 // GetStringUTFChars copies it, so the leak is bounded to a few config strings.
@@ -458,6 +464,10 @@ static jboolean dispatchBoolMethod(jobject recv, MethodEntry* e, va_list) {
 
 // ─── Instance-method call stubs ───────────────────────────────────────────────
 static jobject s_CallObjectMethodV(JNIEnv*, jobject recv, jmethodID mid, va_list args) {
+    // Cocos2d-x games get the original dummy behavior, untouched. Only Unity
+    // (which needs the real Android object graph for its first frame) routes
+    // through the new dispatch.
+    if (!g_unity_mode) { compatLog("JNI CallObjectMethodV"); return (jobject)""; }
     return dispatchObjectMethod(recv, methodEntry(mid), args);
 }
 static jobject s_CallObjectMethod(JNIEnv* env, jobject recv, jmethodID mid, ...) {
@@ -473,6 +483,7 @@ static void s_CallVoidMethodV(JNIEnv*, jobject, jmethodID, va_list) {
     compatLog("JNI CallVoidMethodV");
 }
 static jboolean s_CallBoolMethodV(JNIEnv*, jobject recv, jmethodID mid, va_list args) {
+    if (!g_unity_mode) { compatLog("JNI CallBooleanMethod"); return JNI_FALSE; }
     return dispatchBoolMethod(recv, methodEntry(mid), args);
 }
 static jboolean s_CallBoolMethod(JNIEnv* env, jobject recv, jmethodID mid, ...) {
@@ -490,6 +501,7 @@ static jlong s_CallLongMethod(JNIEnv*, jobject, jmethodID, ...) {
 // new Scanner(InputStream, charset) wraps the stream's bytes so next() can
 // return them; other constructors stay null (unchanged behavior).
 static jobject s_NewObject(JNIEnv*, jclass, jmethodID mid, ...) {
+    if (!g_unity_mode) { compatLog("JNI NewObject"); return nullptr; }
     MethodEntry* e = methodEntry(mid);
     if (e && strstr(e->sig, "Ljava/io/InputStream;")) {
         va_list ap; va_start(ap, mid);
@@ -966,6 +978,10 @@ void* jniFindRegisteredNative(const char* name) {
         if (m.name && strcmp(m.name, name) == 0) return (void*)m.fnPtr;
     return nullptr;
 }
+
+// Enable the Android Java object model (Unity first-frame reflection). Off by
+// default so cocos2d-x games keep the original dummy JNI behavior untouched.
+void jniSetUnityMode(bool on) { g_unity_mode = on; }
 static jint s_MonitorEnter(JNIEnv*, jobject) { return 0; }
 static jint s_MonitorExit(JNIEnv*, jobject)  { return 0; }
 static jint s_GetJavaVM(JNIEnv*, JavaVM** out) {

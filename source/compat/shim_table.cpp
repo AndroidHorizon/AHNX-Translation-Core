@@ -2031,8 +2031,20 @@ static const ShimEntry g_shims[] = {
     // string extras that newlib provides but weren't forwarded
     {"strspn",          (void*)strspn},
 
-    // ── Unity / IL2CPP gap fillers (see the stub block above) ─────────────────
-    // _ctype_ is handled specially in shimResolve (its address is the table).
+    // sentinel
+    {nullptr, nullptr}
+};
+
+// ── Unity / IL2CPP gap fillers — FALLBACK priority ────────────────────────────
+// Resolved AFTER the game's own libraries (see resolveSymbol), NOT before like
+// g_shims. This matters: a cocos2d-x game like Hill Climb Racing statically
+// links its own libc (its own fscanf/_ctype_/div/…) and imports them as
+// undefined; putting these in the override table shadowed the game's real libc
+// with our stubs and broke it (HCR's driving physics regressed). Unity/IL2CPP
+// import the very same names but ship no libc of their own, so for them the
+// game-symbol lookup misses and these fill the gap. _ctype_ is special-cased in
+// shimResolveFallback (its symbol address IS the classification table).
+static const ShimEntry g_unity_fallback_shims[] = {
     {"strdup",          (void*)stub_strdup},
     {"strsep",          (void*)stub_strsep},
     {"strlcpy",         (void*)stub_strlcpy},
@@ -2086,8 +2098,6 @@ static const ShimEntry g_shims[] = {
     {"iswctype",        (void*)stub_iswctype},
     {"wcsftime",        (void*)stub_wcsftime},
     {"writev",          (void*)stub_writev},
-
-    // sentinel
     {nullptr, nullptr}
 };
 
@@ -2096,13 +2106,24 @@ static constexpr size_t NUM_SHIMS = sizeof(g_shims)/sizeof(g_shims[0]) - 1;
 // ─── shimResolve — linear scan (fast enough for N < 400) ──────────────────────
 void* shimResolve(const char* name) {
     if (!name) return nullptr;
-    // _ctype_ is a data symbol whose ADDRESS is the classification table (built
-    // at static init) — hand back the [c+1]=EOF base pointer, not a function.
-    if (strcmp(name, "_ctype_") == 0)
-        return (void*)(g_ctype_base ? g_ctype_base : g_ctype_storage + 128);
     for (size_t i = 0; i < NUM_SHIMS; i++) {
         if (strcmp(g_shims[i].name, name) == 0)
             return g_shims[i].ptr;
+    }
+    return nullptr;
+}
+
+// Fallback resolver — checked only AFTER the game's own libraries (see
+// resolveSymbol). Holds the Unity/IL2CPP libc gap fillers, which must never
+// shadow a game that ships its own copies of these symbols.
+void* shimResolveFallback(const char* name) {
+    if (!name) return nullptr;
+    // _ctype_ is a data symbol whose ADDRESS is the classification table.
+    if (strcmp(name, "_ctype_") == 0)
+        return (void*)(g_ctype_base ? g_ctype_base : g_ctype_storage + 128);
+    for (size_t i = 0; g_unity_fallback_shims[i].name; i++) {
+        if (strcmp(g_unity_fallback_shims[i].name, name) == 0)
+            return g_unity_fallback_shims[i].ptr;
     }
     return nullptr;
 }

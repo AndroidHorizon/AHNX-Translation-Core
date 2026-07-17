@@ -326,11 +326,18 @@ static void* resolveSymbol(const char* name) {
     void* shim = shimResolve(name);
     if (shim) return shim;
 
-    // Fall back to cross-library resolution for game-specific symbols
+    // Then the game's own libraries — a game that ships its own libc (cocos2d-x
+    // titles like Hill Climb Racing statically link newlib) MUST keep using it.
     for (LoadedSo* so : g_loaded_sos) {
         void* p = so->findSym(name);
         if (p) return p;
     }
+
+    // Last: Unity/IL2CPP libc gap fillers. Only reached when neither the shim
+    // overrides nor any game library provides the symbol — i.e. exactly the
+    // undefined imports of libunity/libil2cpp, never a game's own copies.
+    void* fb = shimResolveFallback(name);
+    if (fb) return fb;
 
     return nullptr;
 }
