@@ -946,7 +946,7 @@ struct App {
                 SDL_Rect dst = {avX, avY, avSz, avSz};
                 SDL_RenderCopy(rdr, avatarTex, nullptr, &dst);
             } else {
-                drawMonogram("AndroidHorizon", avX, avY, avSz);
+                drawMonogram("Viridite", avX, avY, avSz);
                 // Centred placeholder text below the monogram — only shown
                 // for the one frame before the bundled avatar decodes
                 static const std::string FETCH = "Loading avatar...";

@@ -1,6 +1,6 @@
 # VNX Translation Core
 
-The game-loading engine half of **[Viridite](https://github.com/AndroidHorizon/AndroidHorizonNX)** — an Android NDK compatibility layer that runs a game's real Android `.so` binary natively on Nintendo Switch, instead of emulating anything. If you're looking for the app you actually launch on your Switch, that's the [AndroidHorizonNX launcher repo](https://github.com/AndroidHorizon/AndroidHorizonNX); this repo is the engine it hands off to.
+The game-loading engine half of **[Viridite](https://github.com/Viridite/Viridite)** — an Android NDK compatibility layer that runs a game's real Android `.so` binary natively on Nintendo Switch, instead of emulating anything. If you're looking for the app you actually launch on your Switch, that's the [Viridite launcher repo](https://github.com/Viridite/Viridite); this repo is the engine it hands off to.
 
 ## What lives here
 
@@ -36,7 +36,7 @@ switch-mesa switch-glad switch-curl switch-mbedtls
 
 Only one game has ever actually been run against this engine — **Hill Climb Racing 1.67.0** (Fingersoft) — fully playable (touch, real audio, real threads, persistent saves, ~locked 60fps), with one known deterministic crash on the Shop/IAP screen (root-caused via `.eh_frame` unwind-table analysis: a generic `std::vector`-append helper handed an invalid reference by the game's own code when its IAP product list is empty — not yet patched, see the launcher repo's compatibility list for the full writeup).
 
-See the [launcher repo's README](https://github.com/AndroidHorizon/AndroidHorizonNX) for the full project history, changelog, roadmap, and game compatibility list.
+See the [launcher repo's README](https://github.com/Viridite/Viridite) for the full project history, changelog, roadmap, and game compatibility list.
 
 ## License
 
