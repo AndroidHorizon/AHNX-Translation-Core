@@ -573,6 +573,32 @@ static void* fake_dlsym(void* handle, const char* sym) {
 static int fake_dlclose(void*) { return 0; }
 static const char* fake_dlerror(void) { return nullptr; }
 
+// ─── EGL graphics-init logging wrappers ───────────────────────────────────────
+// The EGL entries otherwise map straight to the real Switch EGL. Unity sets up
+// its own EGL surface + context in nativeRecreateGfxState, and when that path
+// fails there's nothing in the log to say where. These thin wrappers log the
+// key graphics-init calls (and their results) once, then forward to real EGL —
+// so a Unity bringup shows exactly how its context creation went. cocos2d-x is
+// unaffected (it renders through the Core's own EGL setup, made before any game
+// code runs, and doesn't call these).
+static EGLSurface w_eglCreateWindowSurface(EGLDisplay d, EGLConfig c, EGLNativeWindowType w, const EGLint* a) {
+    EGLSurface s = eglCreateWindowSurface(d, c, w, a);
+    compatLogFmt("EGL: eglCreateWindowSurface(win=%p) -> %p (err=0x%x)", (void*)w, (void*)s, eglGetError());
+    return s;
+}
+static EGLContext w_eglCreateContext(EGLDisplay d, EGLConfig c, EGLContext share, const EGLint* a) {
+    EGLContext ctx = eglCreateContext(d, c, share, a);
+    compatLogFmt("EGL: eglCreateContext(share=%p) -> %p (err=0x%x)", (void*)share, (void*)ctx, eglGetError());
+    return ctx;
+}
+static EGLBoolean w_eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+    EGLBoolean ok = eglMakeCurrent(d, draw, read, ctx);
+    static int n = 0;
+    if (n++ < 4)
+        compatLogFmt("EGL: eglMakeCurrent(draw=%p ctx=%p) -> %d (err=0x%x)", (void*)draw, (void*)ctx, (int)ok, eglGetError());
+    return ok;
+}
+
 // ─── libandroid shims ────────────────────────────────────────────────────────
 // AAssetManager
 static AAsset* asset_open(AAssetManager* mgr, const char* fn, int) {
@@ -1454,12 +1480,12 @@ static const ShimEntry g_shims[] = {
     {"eglChooseConfig",     (void*)eglChooseConfig},
     {"eglGetConfigs",       (void*)eglGetConfigs},
     {"eglGetConfigAttrib",  (void*)eglGetConfigAttrib},
-    {"eglCreateContext",    (void*)eglCreateContext},
+    {"eglCreateContext",    (void*)w_eglCreateContext},
     {"eglDestroyContext",   (void*)eglDestroyContext},
-    {"eglCreateWindowSurface", (void*)eglCreateWindowSurface},
+    {"eglCreateWindowSurface", (void*)w_eglCreateWindowSurface},
     {"eglCreatePbufferSurface",(void*)eglCreatePbufferSurface},
     {"eglDestroySurface",   (void*)eglDestroySurface},
-    {"eglMakeCurrent",      (void*)eglMakeCurrent},
+    {"eglMakeCurrent",      (void*)w_eglMakeCurrent},
     {"eglSwapBuffers",      (void*)eglSwapBuffers},
     {"eglSwapInterval",     (void*)eglSwapInterval},
 

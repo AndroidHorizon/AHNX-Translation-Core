@@ -220,6 +220,11 @@ void*        jniFindRegisteredNative(const char* name);
 // games are completely unaffected.
 void         jniSetUnityMode(bool on);
 
+// Release the Core's SDL2 EGL window surface so Unity can create its own on the
+// display window (see compatUnityReleaseWindow in loader.cpp). Returns the
+// shared EGLDisplay. Unity-path only.
+void*        compatUnityReleaseWindow();
+
 // Normal (mutex-serialized, dedup'd) logger to compat_log.txt. compatLog
 // writes one line; compatLogFmt is printf-style; compatLogFlush forces the
 // buffered file to disk. Defined in loader.cpp.

@@ -438,6 +438,26 @@ static EGLDisplay g_egl_display = EGL_NO_DISPLAY;
 static EGLContext g_egl_context  = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface  = EGL_NO_SURFACE;
 
+// Hand the display window over to Unity. Unlike cocos2d-x (which renders
+// through the Core's SDL2 EGL context), Unity's nativeRecreateGfxState creates
+// its OWN EGL surface + context on the ANativeWindow. Switch/nvn EGL allows a
+// single window surface per nwindow, so the Core's SDL2 surface has to be
+// released first or Unity's eglCreateWindowSurface fails with EGL_BAD_ALLOC.
+// Releases current + destroys the Core's surface, leaving the nwindow free;
+// the SDL2 context object is left alive (harmless, unused from here). Returns
+// the shared EGLDisplay so the Unity path can query/flush if needed.
+void* compatUnityReleaseWindow() {
+    if (g_egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g_egl_surface != EGL_NO_SURFACE) {
+            eglDestroySurface(g_egl_display, g_egl_surface);
+            g_egl_surface = EGL_NO_SURFACE;
+        }
+        compatLog("unity: released Core SDL2 EGL surface — nwindow free for Unity's own context");
+    }
+    return (void*)g_egl_display;
+}
+
 static bool setupEGL(ANativeWindow* win) {
     g_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (g_egl_display == EGL_NO_DISPLAY) {
