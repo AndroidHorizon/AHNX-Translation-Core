@@ -552,6 +552,71 @@ static std::string apkSha256Cached(const std::string& apk_path, const std::strin
     return hash;
 }
 
+// ─── XAPK support ─────────────────────────────────────────────────────────────
+// A .xapk is a plain ZIP whose members are the base APK plus config split APKs
+// (config.arm64_v8a.apk for the 64-bit libs, config.<lang>/<dpi> for resources)
+// and, for Unity titles, Play Asset Delivery packs (UnityDataAssetPack.apk,
+// AddressablesAssetPack.apk) that hold the game data. A real APK never contains
+// .apk members, so their presence is what distinguishes a XAPK from an APK.
+static bool zipContainsApks(const std::string& path) {
+    unzFile zf = unzOpen(path.c_str());
+    if (!zf) return false;
+    bool found = false;
+    unz_global_info gi;
+    if (unzGetGlobalInfo(zf, &gi) == UNZ_OK) {
+        char name[1024];
+        for (uLong i = 0; i < gi.number_entry && !found; i++) {
+            unz_file_info fi;
+            if (unzGetCurrentFileInfo(zf, &fi, name, sizeof(name), nullptr, 0, nullptr, 0) != UNZ_OK) break;
+            std::string n = name;
+            if (n.size() > 4 && n.compare(n.size() - 4, 4, ".apk") == 0) found = true;
+            if (i + 1 < gi.number_entry && unzGoToNextFile(zf) != UNZ_OK) break;
+        }
+    }
+    unzClose(zf);
+    return found;
+}
+static bool isXapk(const std::string& path) {
+    if (path.size() > 5 && path.compare(path.size() - 5, 5, ".xapk") == 0) return true;
+    return zipContainsApks(path);
+}
+
+// Unpack every APK inside the XAPK through the normal extractApk path, merging
+// their arm64 libs + assets into one game dir. arm32/x86 splits are skipped
+// (nothing to contribute here); extractApk itself ignores non-arm64 libs, so
+// this is just to avoid spilling a large split to a temp file for no reason.
+static bool extractXapk(const std::string& xapk_path, const std::string& dest_dir, ProgressCb cb) {
+    unzFile zf = unzOpen(xapk_path.c_str());
+    if (!zf) { compatLogFmt("xapk: cannot open %s", xapk_path.c_str()); return false; }
+    unz_global_info gi;
+    if (unzGetGlobalInfo(zf, &gi) != UNZ_OK) { unzClose(zf); return false; }
+
+    const std::string tmp = dest_dir + "/.split_tmp.apk";
+    char name[1024];
+    int done = 0; bool any = false;
+    for (uLong i = 0; i < gi.number_entry; i++) {
+        unz_file_info fi;
+        if (unzGetCurrentFileInfo(zf, &fi, name, sizeof(name), nullptr, 0, nullptr, 0) != UNZ_OK) break;
+        std::string n = name;
+        bool isApk = n.size() > 4 && n.compare(n.size() - 4, 4, ".apk") == 0 && n.back() != '/';
+        if (isApk) {
+            if (n.find("config.armeabi") != std::string::npos ||
+                n.find("config.x86")     != std::string::npos) {
+                compatLogFmt("xapk: skip %s (non-arm64 split)", n.c_str());
+            } else {
+                compatLogFmt("xapk: unpack %s", n.c_str());
+                if (cb) cb("Installing XAPK", n.c_str());
+                if (extractEntry(zf, tmp) && extractApk(tmp, dest_dir, cb)) { any = true; done++; }
+            }
+        }
+        if (i + 1 < gi.number_entry && unzGoToNextFile(zf) != UNZ_OK) break;
+    }
+    unzClose(zf);
+    remove(tmp.c_str());
+    compatLogFmt("xapk: done (%d apk(s) merged)", done);
+    return any;
+}
+
 // ─── apkInstall ──────────────────────────────────────────────────────────────
 bool apkInstall(const std::string& apk_path, const std::string& pkg_name, ProgressCb cb) {
     std::string base_dir  = std::string("sdmc:/Viridite/games/") + pkg_name;
@@ -559,9 +624,13 @@ bool apkInstall(const std::string& apk_path, const std::string& pkg_name, Progre
     mkdirp(base_dir + "/lib/");
     mkdirp(base_dir + "/assets/");
 
-    if (cb) cb("Installing APK", "Extracting libs and assets...");
-    compatLogFmt("apkInstall: %s -> %s", apk_path.c_str(), pkg_name.c_str());
-    if (!extractApk(apk_path, base_dir, cb)) {
+    bool xapk = isXapk(apk_path);
+    if (cb) cb(xapk ? "Installing XAPK" : "Installing APK", "Extracting libs and assets...");
+    compatLogFmt("apkInstall: %s -> %s (%s)", apk_path.c_str(), pkg_name.c_str(),
+                 xapk ? "xapk" : "apk");
+    bool ok = xapk ? extractXapk(apk_path, base_dir, cb)
+                   : extractApk(apk_path, base_dir, cb);
+    if (!ok) {
         compatLog("apkInstall: extraction failed");
         return false;
     }
