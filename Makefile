@@ -12,7 +12,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	Viridite-Translation-Core-x64
 BUILD		:=	build
-SOURCES		:=	source source/compat unity-runtime/src
+SOURCES		:=	source source/compat source/compat/games unity-runtime/src
 DATA		:=	data
 INCLUDES	:=	include unity-runtime/include
 ROMFS		:=	romfs

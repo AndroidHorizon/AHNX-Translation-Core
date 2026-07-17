@@ -1,4 +1,5 @@
 #include "compat/loader.h"
+#include "compat/games.h"
 #include <switch.h>
 #include <cstring>
 #include <cstdio>
@@ -440,48 +441,25 @@ static void patchAdrpToDataJit(uint8_t* code_buf, size_t code_size,
 }
 
 // ─── Per-game binary quirk patches ─────────────────────────────────────────────
-// A tiny table of instruction-level fixups for specific, identified game
-// binaries, applied to the staged code buffer before it's mapped executable.
-// Each entry is gated on a multi-word byte signature at a fixed vaddr, so it
-// is a strict no-op for any library whose bytes don't match exactly — it can
-// never mis-patch a different game (or a different build of the same game).
-//
-// Hill Climb Racing 1.67.0 (libgame.so, APK sha256 542c25e5…), Shop/IAP crash:
-// the shop scene's product-list builder at libgame.so+0x232240 unconditionally
-// reads featured[size-1] of a std::vector that this APK build leaves empty —
-// its fill paths are all gated behind billing-availability checks the shipped
-// binary hard-codes to `return false`, so on a device with no real Google Play
-// billing (i.e. every Switch) the vector never gets populated. size-1 on an
-// empty vector underflows to a load from address -8 — the deterministic fault
-// at +0x235bb8 (far=0xff…f8) seen on hardware (compat-reports 2480fade + the
-// 2026-07-16 retest). The builder is called at +0x22bbc8 with its result
-// discarded, so NOPing that one call skips the doomed populate entirely: the
-// Shop opens empty (nothing is purchasable here regardless) instead of taking
-// down the whole app. The alternate builder on the neighbouring branch is left
-// untouched. Confirmed via disassembly of this exact libgame.so.
+// The actual fixups live in source/compat/games/ (one file per title), reached
+// through compat/games.h, so game-specific patches stay isolated from the shared
+// loader and from the Unity path. This helper just pulls the owning package id
+// out of the .so path (…/games/<pkg>/lib/<soname>) and forwards.
 static void patchKnownGameQuirks(uint8_t* stage_base, uint64_t min_vaddr,
                                  size_t alloc_size, const char* path) {
-    const char* base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    if (strcmp(base, "libgame.so") != 0) return;
+    const char* soname = strrchr(path, '/');
+    soname = soname ? soname + 1 : path;
 
-    // Signature at the call site: mov x0,x19 / bl 0x232240 / ldr x0,[x19,#0x360]
-    // (0x22bbc4, 0x22bbc8, 0x22bbcc respectively) plus the b/mov ahead of it.
-    constexpr uint64_t kSiteVaddr = 0x22bbc8;
-    constexpr uint32_t kExpectedBl = 0x9400199e;   // bl #0x232240 from 0x22bbc8
-    constexpr uint32_t kNop        = 0xd503201f;
-    if (kSiteVaddr < min_vaddr || kSiteVaddr + 4 > min_vaddr + alloc_size) return;
-
-    uint32_t* at = (uint32_t*)(stage_base + kSiteVaddr);
-    // Verify the exact neighbourhood so this only ever fires on this build.
-    if (at[-1] != 0xaa1303e0u ||   // mov x0, x19
-        at[ 0] != kExpectedBl  ||   // bl 0x232240 (the shop-populate call)
-        at[ 1] != 0xf941b260u) {    // ldr x0, [x19, #0x360]
-        return;
+    char pkg[128] = {0};
+    const char* g = strstr(path, "/games/");
+    if (g) {
+        g += 7;                              // past "/games/"
+        const char* slash = strchr(g, '/');
+        size_t n = slash ? (size_t)(slash - g) : strlen(g);
+        if (n >= sizeof(pkg)) n = sizeof(pkg) - 1;
+        memcpy(pkg, g, n);
     }
-    at[0] = kNop;
-    compatLog("quirk: HCR libgame.so — NOP'd Shop product-list populate at +0x22bbc8 "
-              "(empty-vector crash; shop opens empty, no billing backend exists)");
+    gameApplyQuirks(pkg, soname, stage_base, min_vaddr, alloc_size);
 }
 
 // ─── RELA relocation processing ───────────────────────────────────────────────

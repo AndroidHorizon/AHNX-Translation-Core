@@ -1,5 +1,6 @@
 #include "compat/loader.h"
 #include "compat/jni.h"
+#include "compat/games.h"
 #include <switch.h>
 #include <string.h>
 #include <cstring>
@@ -572,19 +573,14 @@ static jint s_CallStaticIntMethodV(JNIEnv*, jclass, jmethodID mid, va_list args)
         compatLogFmt("JNI %s() → %u", e->name, pct);
         return (jint)pct;
     }
-    // getMarketVariation() tells the game which store build it's running as —
-    // disassembly of libgame.so shows the Shop screen switches on it: 1/8 →
-    // Google Play shop layout, 5 → another store's, anything else → a path
-    // whose "is IAP available" gate is compiled as a literal `return false`,
-    // which skips populating the shop's item vector entirely. The Shop screen
-    // builder then reads items[size-1] of that empty vector — a load from
-    // address -8, the deterministic Shop/IAP crash at libgame.so+0x235bb8
-    // seen on hardware (compat-reports 2480fade + the 2026-07-16 retest).
-    // Our dummy 0 return was steering it into that dead path; claim the
-    // Google Play variation instead, matching the rest of this compat layer.
+    // getMarketVariation() tells the game which store build it's running as. The
+    // value that keeps a given title's shop path sane is a per-game decision, so
+    // it lives in that game's profile (source/compat/games/) rather than here.
     if (e && strcmp(e->name, "getMarketVariation") == 0) {
-        compatLog("JNI getMarketVariation() → 1 (Google Play)");
-        return 1;
+        int v = gameMarketVariation(packageName().c_str());
+        if (v < 0) v = 1;   // no profile opinion → claim Google Play
+        compatLogFmt("JNI getMarketVariation() → %d", v);
+        return v;
     }
     // SimpleAudioEngine: playEffect(path, loop, pitch, pan[, gain]) → effect id
     if (e && strcmp(e->name, "playEffect") == 0) {
