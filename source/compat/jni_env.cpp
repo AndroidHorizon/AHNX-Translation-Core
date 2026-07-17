@@ -94,13 +94,18 @@ static bool        g_ud_dirty = false;
 // again, progress gone). Serialize to <game>/userdefaults.bin on every
 // UserDefault.flush and at game exit; load before nativeInit.
 // Record: [u8 type I/S/F][u32 klen][key][u32 vlen][value]
-static void udWrite(FILE* f, char t, const std::string& k, const void* v, uint32_t vlen) {
+// Appends one record to an in-memory buffer. The old version did five separate
+// fwrite() calls per key straight to the FILE*; across ~5300 keys that's ~26k
+// libc calls per save, a measurable chunk of the ~700-900ms per-save stall on
+// SD. Building the whole image in RAM and flushing it in a single fwrite (see
+// udWriteSnapshot) turns that into one write.
+static void udAppend(std::string& buf, char t, const std::string& k, const void* v, uint32_t vlen) {
     uint32_t klen = (uint32_t)k.size();
-    fwrite(&t, 1, 1, f);
-    fwrite(&klen, 4, 1, f);
-    fwrite(k.data(), 1, klen, f);
-    fwrite(&vlen, 4, 1, f);
-    fwrite(v, 1, vlen, f);
+    buf.append(1, t);
+    buf.append((const char*)&klen, 4);
+    buf.append(k.data(), klen);
+    buf.append((const char*)&vlen, 4);
+    buf.append((const char*)v, vlen);
 }
 
 // A snapshot of the store at the moment a save was triggered — cheap map
@@ -117,24 +122,29 @@ struct UdSnapshot {
 };
 
 static void udWriteSnapshot(const UdSnapshot& snap) {
+    // Serialize the whole store into one RAM buffer first, then write it with a
+    // single fwrite — one SD transaction instead of ~26k tiny ones. Reserve up
+    // front so the append loop never reallocates mid-build.
+    std::string buf;
+    buf.reserve(snap.ints.size() * 24 + snap.floats.size() * 24 + snap.strs.size() * 48 + 64);
+    for (auto& kv : snap.ints)   { int32_t v = kv.second; udAppend(buf, 'I', kv.first, &v, 4); }
+    for (auto& kv : snap.floats) { float   v = kv.second; udAppend(buf, 'F', kv.first, &v, 4); }
+    for (auto& kv : snap.strs)   udAppend(buf, 'S', kv.first, kv.second.data(), (uint32_t)kv.second.size());
+
     std::string tmp = snap.path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) { compatLogFmt("UserDefaults: save open FAIL %s", tmp.c_str()); return; }
-    for (auto& kv : snap.ints) {
-        int32_t v = kv.second;
-        udWrite(f, 'I', kv.first, &v, 4);
-    }
-    for (auto& kv : snap.floats) {
-        float v = kv.second;
-        udWrite(f, 'F', kv.first, &v, 4);
-    }
-    for (auto& kv : snap.strs)
-        udWrite(f, 'S', kv.first, kv.second.data(), (uint32_t)kv.second.size());
+    size_t wrote = fwrite(buf.data(), 1, buf.size(), f);
     fclose(f);
+    if (wrote != buf.size()) {
+        compatLogFmt("UserDefaults: save write short (%zu/%zu) — keeping old file", wrote, buf.size());
+        remove(tmp.c_str());
+        return;
+    }
     remove(snap.path.c_str());
     rename(tmp.c_str(), snap.path.c_str());
-    compatLogFmt("UserDefaults: saved %zu ints, %zu floats, %zu strings",
-                 snap.ints.size(), snap.floats.size(), snap.strs.size());
+    compatLogFmt("UserDefaults: saved %zu ints, %zu floats, %zu strings (%zu bytes, one write)",
+                 snap.ints.size(), snap.floats.size(), snap.strs.size(), buf.size());
 }
 
 // A background-thread hand-off for the actual disk write was tried here
