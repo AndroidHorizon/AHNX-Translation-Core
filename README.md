@@ -1,11 +1,11 @@
-# AHNX Translation Core
+# VNX Translation Core
 
 The game-loading engine half of **[Viridite](https://github.com/AndroidHorizon/AndroidHorizonNX)** — an Android NDK compatibility layer that runs a game's real Android `.so` binary natively on Nintendo Switch, instead of emulating anything. If you're looking for the app you actually launch on your Switch, that's the [AndroidHorizonNX launcher repo](https://github.com/AndroidHorizon/AndroidHorizonNX); this repo is the engine it hands off to.
 
 ## What lives here
 
-- **`AHNX-Translation-Core-x64`** — the real engine: custom ARM64 ELF loader (JIT dual-mapping, relocation, symbol resolution), a JNI/JavaVM emulation layer, real pthreads, real audio (SDL2_mixer), real accelerometer/gyroscope/battery via libnx. Built from `source/` + `source/compat/` at the repo root.
-- **`AHNX-Translation-Core-x32`** (`core32/`) — a placeholder. 32-bit (`armeabi-v7a`) Android binaries aren't supported yet — running AArch32 code on Switch is possible in principle (real prior art exists for it), but the one precedent project we found for this depends on a 32-bit libnx build that isn't publicly available anywhere. This binary just explains that; it doesn't do anything else yet.
+- **`VNX-Translation-Core-x64`** — the real engine: custom ARM64 ELF loader (JIT dual-mapping, relocation, symbol resolution), a JNI/JavaVM emulation layer, real pthreads, real audio (SDL2_mixer), real accelerometer/gyroscope/battery via libnx. Built from `source/` + `source/compat/` at the repo root.
+- **`VNX-Translation-Core-x32`** (`core32/`) — a placeholder. 32-bit (`armeabi-v7a`) Android binaries aren't supported yet — running AArch32 code on Switch is possible in principle (real prior art exists for it), but the one precedent project we found for this depends on a 32-bit libnx build that isn't publicly available anywhere. This binary just explains that; it doesn't do anything else yet.
 
 ## Why this is a separate binary from the launcher
 
@@ -19,7 +19,7 @@ Requires [devkitPro](https://devkitpro.org/) with `devkitA64` and `libnx` instal
 
 ```sh
 export DEVKITPRO=/opt/devkitpro
-make            # builds AHNX-Translation-Core-x64.nro at the repo root
+make            # builds VNX-Translation-Core-x64.nro at the repo root
 make -C core32  # builds the x32 placeholder
 ```
 
