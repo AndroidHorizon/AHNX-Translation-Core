@@ -52,6 +52,10 @@ static void memFault(const char* op, uint32_t g) {
 }
 static inline uint32_t rd32(uint32_t g){ if (!guestValid(g,4)) { memFault("rd32", g); return 0; } return *(uint32_t*)toHost(g); }
 static inline void      wr32(uint32_t g, uint32_t v){ if (!guestValid(g,4)) { memFault("wr32", g); return; } *(uint32_t*)toHost(g) = v; }
+static inline uint32_t rd16(uint32_t g){ if (!guestValid(g,2)) { memFault("rd16", g); return 0; } return *(uint16_t*)toHost(g); }
+static inline void      wr16(uint32_t g, uint16_t v){ if (!guestValid(g,2)) { memFault("wr16", g); return; } *(uint16_t*)toHost(g) = v; }
+static inline uint32_t rd8 (uint32_t g){ if (!guestValid(g,1)) { memFault("rd8", g); return 0; } return *(uint8_t*)toHost(g); }
+static inline void      wr8 (uint32_t g, uint8_t v){ if (!guestValid(g,1)) { memFault("wr8", g); return; } *(uint8_t*)toHost(g) = v; }
 
 // Barrel shifter for ARM data-processing operand2 (immediate-shift form).
 static uint32_t shiftImm(CpuState& c, uint32_t val, uint32_t type, uint32_t amt, bool setc, bool& carry) {
@@ -235,6 +239,132 @@ static void stepThumb(CpuState& c) {
             case 2: c.r[rd]=addWithCarry(c, c.r[rd], imm, 0, true); break;  // ADD
             case 3: c.r[rd]=addWithCarry(c, c.r[rd], ~imm, 1, true); break; // SUB
         }
+        return;
+    }
+    // Add/sub register or 3-bit immediate (00011)
+    if ((op & 0xF800) == 0x1800) {
+        uint32_t rd=op&7, rn=(op>>3)&7, arg=(op>>6)&7;
+        bool imm=(op>>10)&1, sub=(op>>9)&1;
+        uint32_t b = imm ? arg : c.r[arg];
+        c.r[rd] = sub ? addWithCarry(c, c.r[rn], ~b, 1, true)
+                      : addWithCarry(c, c.r[rn], b, 0, true);
+        return;
+    }
+    // Shift by immediate: LSL/LSR/ASR (000xx, not 00011)
+    if ((op & 0xE000) == 0x0000) {
+        uint32_t rd=op&7, rm=(op>>3)&7, amt=(op>>6)&0x1F, type=(op>>11)&3;
+        bool co=cf(c); uint32_t v=shiftImm(c, c.r[rm], type, amt, true, co);
+        c.r[rd]=v; setNZ(c,v); setC(c,co);
+        return;
+    }
+    // ALU register ops (010000)
+    if ((op & 0xFC00) == 0x4000) {
+        uint32_t rd=op&7, rm=(op>>3)&7, aop=(op>>6)&0xF, a=c.r[rd], b=c.r[rm];
+        bool co=cf(c); uint32_t r=a;
+        switch (aop) {
+            case 0x0: r=a&b; setNZ(c,r); break;                        // AND
+            case 0x1: r=a^b; setNZ(c,r); break;                        // EOR
+            case 0x2: r=shiftImm(c,a,0,b&0xFF,true,co); setNZ(c,r); setC(c,co); break; // LSL reg
+            case 0x3: r=shiftImm(c,a,1,b&0xFF,true,co); setNZ(c,r); setC(c,co); break; // LSR reg
+            case 0x4: r=shiftImm(c,a,2,b&0xFF,true,co); setNZ(c,r); setC(c,co); break; // ASR reg
+            case 0x5: r=addWithCarry(c,a,b,cf(c),true); break;         // ADC
+            case 0x6: r=addWithCarry(c,a,~b,cf(c),true); break;        // SBC
+            case 0x7: r=shiftImm(c,a,3,b&0xFF,true,co); setNZ(c,r); setC(c,co); break; // ROR reg
+            case 0x8: setNZ(c,a&b); return;                            // TST (no wb)
+            case 0x9: r=addWithCarry(c,0,~b,1,true); break;            // NEG (RSB #0)
+            case 0xA: addWithCarry(c,a,~b,1,true); return;             // CMP (no wb)
+            case 0xB: addWithCarry(c,a,b,0,true); return;              // CMN (no wb)
+            case 0xC: r=a|b; setNZ(c,r); break;                        // ORR
+            case 0xD: r=a*b; setNZ(c,r); break;                        // MUL
+            case 0xE: r=a&~b; setNZ(c,r); break;                       // BIC
+            case 0xF: r=~b; setNZ(c,r); break;                         // MVN
+        }
+        c.r[rd]=r;
+        return;
+    }
+    // Hi-register ADD/CMP/MOV (010001) — BX/BLX (0x4700) already handled above
+    if ((op & 0xFC00) == 0x4400) {
+        uint32_t aop=(op>>8)&3, rd=((op&0x80)>>4)|(op&7), rm=(op>>3)&0xF;
+        uint32_t vm = (rm==15)?(pc+4):c.r[rm];
+        switch (aop) {
+            case 0: { uint32_t v=c.r[rd]+vm; if(rd==15){c.r[15]=v&~1u;} else c.r[rd]=v; } return; // ADD
+            case 1: addWithCarry(c, c.r[rd], ~vm, 1, true); return;    // CMP
+            case 2: if(rd==15){c.cpsr=(vm&1)?(c.cpsr|C_T):(c.cpsr&~C_T); c.r[15]=vm&~1u;} else c.r[rd]=vm; return; // MOV
+        }
+        return;
+    }
+    // LDR literal (PC-relative) — 01001
+    if ((op & 0xF800) == 0x4800) {
+        uint32_t rd=(op>>8)&7, imm=(op&0xFF)*4;
+        c.r[rd] = rd32(((pc+4)&~3u) + imm);
+        return;
+    }
+    // Load/store register offset — 0101
+    if ((op & 0xF000) == 0x5000) {
+        uint32_t rd=op&7, rn=(op>>3)&7, rm=(op>>6)&7, opc=(op>>9)&7;
+        uint32_t addr=c.r[rn]+c.r[rm];
+        switch (opc) {
+            case 0: wr32(addr, c.r[rd]); break;                        // STR
+            case 1: wr16(addr, (uint16_t)c.r[rd]); break;              // STRH
+            case 2: wr8(addr, (uint8_t)c.r[rd]); break;                // STRB
+            case 3: c.r[rd]=(int32_t)(int8_t)rd8(addr); break;         // LDRSB
+            case 4: c.r[rd]=rd32(addr); break;                         // LDR
+            case 5: c.r[rd]=rd16(addr); break;                         // LDRH
+            case 6: c.r[rd]=rd8(addr); break;                          // LDRB
+            case 7: c.r[rd]=(int32_t)(int16_t)rd16(addr); break;       // LDRSH
+        }
+        return;
+    }
+    // Load/store word/byte immediate offset — 011
+    if ((op & 0xE000) == 0x6000) {
+        uint32_t rd=op&7, rn=(op>>3)&7, imm=(op>>6)&0x1F;
+        bool byte=(op>>12)&1, load=(op>>11)&1;
+        uint32_t addr=c.r[rn]+(byte?imm:imm*4);
+        if (load) c.r[rd]=byte?rd8(addr):rd32(addr);
+        else      { if(byte) wr8(addr,(uint8_t)c.r[rd]); else wr32(addr,c.r[rd]); }
+        return;
+    }
+    // Load/store halfword immediate — 1000
+    if ((op & 0xF000) == 0x8000) {
+        uint32_t rd=op&7, rn=(op>>3)&7, imm=((op>>6)&0x1F)*2;
+        uint32_t addr=c.r[rn]+imm;
+        if ((op>>11)&1) c.r[rd]=rd16(addr); else wr16(addr,(uint16_t)c.r[rd]);
+        return;
+    }
+    // SP-relative load/store — 1001
+    if ((op & 0xF000) == 0x9000) {
+        uint32_t rd=(op>>8)&7, imm=(op&0xFF)*4, addr=c.r[13]+imm;
+        if ((op>>11)&1) c.r[rd]=rd32(addr); else wr32(addr,c.r[rd]);
+        return;
+    }
+    // ADR / ADD sp (load address) — 1010
+    if ((op & 0xF000) == 0xA000) {
+        uint32_t rd=(op>>8)&7, imm=(op&0xFF)*4;
+        c.r[rd] = ((op>>11)&1) ? (c.r[13]+imm) : (((pc+4)&~3u)+imm);
+        return;
+    }
+    // ADD/SUB sp immediate — 10110000
+    if ((op & 0xFF00) == 0xB000) {
+        uint32_t imm=(op&0x7F)*4;
+        c.r[13] = (op&0x80) ? c.r[13]-imm : c.r[13]+imm;
+        return;
+    }
+    // Sign/zero extend (SXTH/SXTB/UXTH/UXTB) — 1011 0010
+    if ((op & 0xFF00) == 0xB200) {
+        uint32_t rd=op&7, rm=(op>>3)&7, v=c.r[rm];
+        switch ((op>>6)&3) {
+            case 0: c.r[rd]=(int32_t)(int16_t)v; break;   // SXTH
+            case 1: c.r[rd]=(int32_t)(int8_t)v; break;    // SXTB
+            case 2: c.r[rd]=v&0xFFFF; break;              // UXTH
+            case 3: c.r[rd]=v&0xFF; break;                // UXTB
+        }
+        return;
+    }
+    // LDMIA/STMIA — 1100
+    if ((op & 0xF000) == 0xC000) {
+        uint32_t rn=(op>>8)&7, list=op&0xFF, a=c.r[rn]; bool load=(op>>11)&1;
+        for (int i=0;i<8;i++) if (list&(1<<i)) { if(load) c.r[i]=rd32(a); else wr32(a,c.r[i]); a+=4; }
+        if (!(load && (list&(1<<rn)))) c.r[rn]=a;   // writeback unless loaded rn
         return;
     }
 
