@@ -159,6 +159,7 @@ struct App {
     TTF_Font*    fBootF = nullptr;     // 11px caps footer
     bool         bootReady   = false;
     std::string  launchTitle;          // game name shown under the gem
+    SDL_Texture* gameIconTex = nullptr;// launching game's icon (revealed by the gem)
     bool         showLogPanel = false; // Y toggles the compat_log feed back on
 
     // One-shot README screenshot flags (each screen captured once per run)
@@ -275,6 +276,7 @@ struct App {
         if (bgTex) SDL_DestroyTexture(bgTex);
         for (auto* t : icons) if (t) SDL_DestroyTexture(t);
         // Boot-animation assets
+        if (gameIconTex) SDL_DestroyTexture(gameIconTex);
         if (gemTex)     SDL_DestroyTexture(gemTex);
         if (bootBgTex)  SDL_DestroyTexture(bootBgTex);
         if (ringOutTex) SDL_DestroyTexture(ringOutTex);
@@ -303,6 +305,23 @@ struct App {
         SDL_SetRenderDrawColor(rdr, c.r, c.g, c.b, c.a);
         SDL_Rect r = {x, y, w, h};
         SDL_RenderFillRect(rdr, &r);
+    }
+
+    // Filled rounded rectangle (centre + edges + four corner quarter-discs).
+    void fillRoundedRect(int x, int y, int w, int h, int rad, SDL_Color c) {
+        if (rad * 2 > w) rad = w / 2;
+        if (rad * 2 > h) rad = h / 2;
+        fill(x + rad, y, w - 2 * rad, h, c);         // centre column
+        fill(x, y + rad, rad, h - 2 * rad, c);       // left edge
+        fill(x + w - rad, y + rad, rad, h - 2 * rad, c); // right edge
+        SDL_SetRenderDrawColor(rdr, c.r, c.g, c.b, c.a);
+        for (int dy = 0; dy < rad; dy++) {
+            int dx = (int)(sqrtf((float)(rad * rad - (rad - dy) * (rad - dy))) + 0.5f);
+            SDL_Rect top = {x + rad - dx, y + dy, 2 * dx + (w - 2 * rad), 1};
+            SDL_Rect bot = {x + rad - dx, y + h - 1 - dy, 2 * dx + (w - 2 * rad), 1};
+            SDL_RenderFillRect(rdr, &top);
+            SDL_RenderFillRect(rdr, &bot);
+        }
     }
 
     int drawText(TTF_Font* f, const std::string& s, SDL_Color col, int x, int y) {
@@ -865,30 +884,62 @@ struct App {
             fillCircle(s.cx, s.cy, (int)(s.r * (0.4f + 0.6f * k) + 0.5f), c);
         }
 
-        // ── Gem: float (gemFloat 3.4s) + shine sweep clipped to its silhouette ──
-        float fph   = (now % 3400) / 3400.0f;
-        float fk    = 0.5f - 0.5f * cosf(fph * 2.0f * PI_F);
-        float lift  = -14.0f * fk;
-        float scale = 1.0f + 0.015f * fk;
-        if (gemTex && gemFrame) {
+        // ── Gem → game-icon reveal ──────────────────────────────────────────
+        // Matches the boot animation: the gem pulses, then "breaks" and the
+        // launching game's own icon bursts through. Without a game icon it just
+        // keeps the gentle float. One 4.8s cycle.
+        const bool haveIcon = (gameIconTex != nullptr);
+        float lift = 0.0f, gemScale = 1.0f, gemAlpha = 1.0f;
+        float cyc = (now % 4800) / 4800.0f;
+        if (!haveIcon) {
+            float fk = 0.5f - 0.5f * cosf(((now % 3400) / 3400.0f) * 2.0f * PI_F);
+            lift = -14.0f * fk; gemScale = 1.0f + 0.015f * fk;
+        } else if (cyc < 0.47f) {
+            gemScale = 1.0f + 0.05f * (0.5f - 0.5f * cosf((cyc / 0.47f) * 2.0f * PI_F));
+        } else if (cyc < 0.56f) {
+            float t = (cyc - 0.47f) / 0.09f; gemScale = 1.0f + 0.4f * t; gemAlpha = 1.0f - t;
+        } else {
+            gemAlpha = 0.0f;
+        }
+
+        if (gemTex && gemFrame && gemAlpha > 0.01f) {
             SDL_Texture* prev = SDL_GetRenderTarget(rdr);
             SDL_SetRenderTarget(rdr, gemFrame);
             SDL_SetRenderDrawColor(rdr, 0, 0, 0, 0);
             SDL_RenderClear(rdr);
             SDL_RenderCopy(rdr, gemTex, nullptr, nullptr);
-            // ADD leaves destination alpha untouched, so the band only lights up
-            // pixels the gem already covers — the render-target equivalent of the
-            // design's SVG clipPath.
             if (sweepTex) {
-                float t = (now % 2800) / 2800.0f;
-                float p = t / 0.55f; if (p > 1.0f) p = 1.0f;
+                float p = ((now % 2800) / 2800.0f) / 0.55f; if (p > 1.0f) p = 1.0f;
                 SDL_Rect sd = {(int)(-221.0f + p * 541.0f), 0, 57, GEM_PX};
                 SDL_RenderCopyEx(rdr, sweepTex, nullptr, &sd, -18.0, nullptr, SDL_FLIP_NONE);
             }
             SDL_SetRenderTarget(rdr, prev);
-            int gw = (int)(GEM_PX * scale + 0.5f);
+            int gw = (int)(GEM_PX * gemScale + 0.5f);
             SDL_Rect gd = {SW / 2 - gw / 2, (int)(GEM_CY - gw / 2 + lift + 0.5f), gw, gw};
+            SDL_SetTextureAlphaMod(gemFrame, (Uint8)(gemAlpha * 255));
             SDL_RenderCopy(rdr, gemFrame, nullptr, &gd);
+            SDL_SetTextureAlphaMod(gemFrame, 255);
+        }
+
+        // Flash at the break, then the game icon bursts in and holds.
+        if (haveIcon && cyc >= 0.52f && cyc < 0.63f) {
+            float t = (cyc - 0.52f) / 0.11f, a = t < 0.3f ? t / 0.3f : (1.0f - t) / 0.7f;
+            fillCircle(SW / 2, GEM_CY, (int)(150 * (0.7f + t)), {255, 255, 255, (Uint8)(190 * a)});
+        }
+        if (haveIcon && cyc >= 0.51f) {
+            float scale, alpha;
+            if      (cyc < 0.56f) { float u=(cyc-0.51f)/0.05f; scale=0.55f+0.17f*u; alpha=u; }
+            else if (cyc < 0.66f) { float u=(cyc-0.56f)/0.10f; scale=0.72f+0.32f*u; alpha=1.0f; }
+            else if (cyc < 0.72f) { float u=(cyc-0.66f)/0.06f; scale=1.04f-0.04f*u; alpha=1.0f; }
+            else if (cyc < 0.97f) { scale=1.0f; alpha=1.0f; }
+            else                  { scale=1.0f; alpha=1.0f-(cyc-0.97f)/0.03f; }
+            int isz = (int)(150 * scale + 0.5f);
+            fillRoundedRect(SW/2 - isz/2 - 4, GEM_CY - isz/2 - 4, isz + 8, isz + 8, 32,
+                            {255, 255, 255, (Uint8)(alpha * 240)});
+            SDL_SetTextureAlphaMod(gameIconTex, (Uint8)(alpha * 255));
+            SDL_Rect id = {SW/2 - isz/2, GEM_CY - isz/2, isz, isz};
+            SDL_RenderCopy(rdr, gameIconTex, nullptr, &id);
+            SDL_SetTextureAlphaMod(gameIconTex, 255);
         }
 
         // ── Caption: game title over stage text + blinking dots ──
@@ -949,9 +1000,18 @@ struct App {
 
         // Detail log is in-memory — no cache to invalidate, always fresh
 
-        // The boot animation captions itself with the game being loaded
+        // The boot animation captions itself with the game being loaded, and
+        // shows the game's own icon (the gem "reveals" it).
         launchTitle = !apk.appName.empty() ? apk.appName
                     : (!apk.packageName.empty() ? apk.packageName : apk.filename);
+        if (gameIconTex) { SDL_DestroyTexture(gameIconTex); gameIconTex = nullptr; }
+        if (!apk.iconPng.empty()) {
+            SDL_RWops* rw = SDL_RWFromConstMem(apk.iconPng.data(), (int)apk.iconPng.size());
+            if (SDL_Surface* s = IMG_Load_RW(rw, 1)) {
+                gameIconTex = SDL_CreateTextureFromSurface(rdr, s);
+                SDL_FreeSurface(s);
+            }
+        }
 
         // Set initial stage before thread starts so first frame looks right
         const char* verb = skipInstall ? "Launching (cached)" : "Installing + Launching";
