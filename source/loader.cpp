@@ -733,9 +733,11 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
             while (!installedFrom.empty() && (installedFrom.back()=='\n' || installedFrom.back()=='\r'))
                 installedFrom.pop_back();
         }
-        if (installedFrom != apk_path) {
-            compatLogFmt("launchApk: cached install is from '%s' but launching '%s' — re-extracting",
-                         installedFrom.c_str(), apk_path.c_str());
+        bool noLibs = findAllSos(lib_dir).empty() && findAllSos(base_dir + "/lib32").empty();
+        if (installedFrom != apk_path || noLibs) {
+            compatLogFmt("launchApk: re-extracting (%s)",
+                         noLibs ? "cached install has no arm64/arm32 libs — likely from an older build"
+                                : "cached install is from a different file");
             rmTree(lib_dir);
             rmTree(base_dir + "/lib32");
             rmTree(asset_dir);
