@@ -6,6 +6,7 @@
 #include "compat/loader.h"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <cmath>
 #include <cctype>
 #include <strings.h>
@@ -16,6 +17,11 @@ namespace a32 {
 
 struct Import { std::string name; };
 static std::vector<Import> s_imports;
+
+// Guest FILE* handle table: a guest "FILE*" is (index into s_files)+1, so 0 is
+// a clean NULL. gfile() maps a handle back to the host FILE*.
+static std::vector<FILE*> s_files;
+static FILE* gfile(uint32_t h) { return (h && h <= s_files.size()) ? s_files[h-1] : nullptr; }
 
 uint32_t bridgeRegister(const char* name) {
     for (size_t i = 0; i < s_imports.size(); i++)
@@ -173,6 +179,36 @@ static bool dispatch(CpuState& c, const char* name, uint32_t& ret) {
     if (!strcmp(name,"srand"))   { srand(arg(c,0)); ret = 0; return true; }
     if (!strcmp(name,"time"))    { uint32_t p=arg(c,0); if(p && guestValid(p,4)) *(uint32_t*)toHost(p)=0; ret = 0; return true; }
     if (!strcmp(name,"malloc_usable_size")) { ret = 0; return true; }
+
+    // ── stdio file I/O — guest FILE* is an index into s_files; paths resolve
+    //    against the game's asset dir (logged, so runs reveal what's opened). ──
+    if (!strcmp(name,"fopen")) {
+        const char* gp = hstr(arg(c,0)); const char* mode = hstr(arg(c,1));
+        if (!gp) { ret = 0; return true; }
+        std::string path = gp;
+        if (path.rfind("sdmc:",0)!=0 && path.rfind("/",0)!=0) path = std::string(g_asset_dir) + gp;
+        else if (path.rfind("assets/",0)==0) path = std::string(g_asset_dir) + (gp+7);
+        FILE* f = fopen(path.c_str(), mode?mode:"rb");
+        compatLogFmt("arm32: fopen(%s,%s) -> %s", gp, mode?mode:"?", f?"ok":"FAIL");
+        if (!f) { ret = 0; return true; }
+        s_files.push_back(f); ret = (uint32_t)s_files.size();   // handle = index+1
+        return true;
+    }
+    if (!strcmp(name,"fclose")) { FILE* f=gfile(arg(c,0)); if(f){fclose(f); s_files[arg(c,0)-1]=nullptr;} ret=0; return true; }
+    if (!strcmp(name,"fread")) {
+        uint32_t p=arg(c,0), sz=arg(c,1)*arg(c,2); FILE* f=gfile(arg(c,3));
+        ret = (f && guestValid(p,sz)) ? (uint32_t)(fread(hptr(p),1,sz,f)/(arg(c,1)?arg(c,1):1)) : 0; return true;
+    }
+    if (!strcmp(name,"fwrite")) {
+        uint32_t p=arg(c,0), sz=arg(c,1)*arg(c,2); FILE* f=gfile(arg(c,3));
+        ret = (f && guestValid(p,sz)) ? (uint32_t)(fwrite(hptr(p),1,sz,f)/(arg(c,1)?arg(c,1):1)) : 0; return true;
+    }
+    if (!strcmp(name,"fseek"))  { FILE* f=gfile(arg(c,0)); ret = f?(uint32_t)fseek(f,(long)arg(c,1),(int)arg(c,2)):(uint32_t)-1; return true; }
+    if (!strcmp(name,"ftell"))  { FILE* f=gfile(arg(c,0)); ret = f?(uint32_t)ftell(f):(uint32_t)-1; return true; }
+    if (!strcmp(name,"rewind")) { FILE* f=gfile(arg(c,0)); if(f) rewind(f); ret=0; return true; }
+    if (!strcmp(name,"feof"))   { FILE* f=gfile(arg(c,0)); ret = f?(uint32_t)feof(f):1; return true; }
+    if (!strcmp(name,"fgetc"))  { FILE* f=gfile(arg(c,0)); ret = f?(uint32_t)fgetc(f):(uint32_t)-1; return true; }
+    if (!strcmp(name,"fflush")) { FILE* f=gfile(arg(c,0)); if(f) fflush(f); ret=0; return true; }
 
     return false;
 }

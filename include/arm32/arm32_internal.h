@@ -22,6 +22,8 @@ static constexpr uint32_t A32_RETURN_TRAP = 0xFFFFFFF0;
 // ── Memory (arm32_mem.cpp) ──────────────────────────────────────────────────
 extern uint8_t* g_base;
 extern size_t   g_region;
+// Host path of the game's extracted assets/ dir, for the file-I/O bridge.
+extern const char* g_asset_dir;
 bool     memInit();
 bool     guestValid(uint32_t addr, uint32_t len);
 uint32_t guestAlloc(uint32_t size);

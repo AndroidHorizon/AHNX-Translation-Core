@@ -5,10 +5,13 @@
 #include "arm32/arm32_internal.h"
 #include "compat/loader.h"
 #include <cstdio>
+#include <string>
 
 namespace a32 {
 
 static constexpr uint32_t CPSR_T = 0x20;   // Thumb bit
+static std::string s_asset_dir;
+const char* g_asset_dir = "";
 
 bool isElf32Arm(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -37,6 +40,9 @@ static uint32_t callGuest(CpuState& c, uint32_t func, uint32_t a0=0, uint32_t a1
 int run(const char* main_so_host_path, const char* pkg) {
     compatLogFmt("arm32: bring-up for %s (%s)", pkg ? pkg : "?", main_so_host_path);
     if (!memInit()) return -1;
+
+    s_asset_dir = std::string("sdmc:/Viridite/games/") + (pkg ? pkg : "") + "/assets/";
+    g_asset_dir = s_asset_dir.c_str();
 
     LoadedElf32 elf = elf32Load(main_so_host_path);
     if (!elf.ok) { compatLog("arm32: ELF32 load failed"); return -2; }
