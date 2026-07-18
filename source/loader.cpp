@@ -312,12 +312,19 @@ static bool extractApk(const std::string& apk_path, const std::string& dest_dir,
     if (unzGetGlobalInfo(zf, &gi) != UNZ_OK) { unzClose(zf); return false; }
 
     char name[1024];
+    int extracted = 0;
     for (uLong i = 0; i < gi.number_entry; i++) {
         unz_file_info fi;
         if (unzGetCurrentFileInfo(zf, &fi, name, sizeof(name),
                                   nullptr, 0, nullptr, 0) != UNZ_OK) break;
 
         std::string n = name;
+        // Periodic on-disk progress so a big asset extraction never looks frozen.
+        if ((++extracted & 0x1FF) == 0) {
+            compatLogFmt("extract: %d/%lu files...", extracted, (unsigned long)gi.number_entry);
+            compatLogFlush();
+            if (cb) { char b[64]; snprintf(b, sizeof(b), "%d files...", extracted); cb("Extracting", b); }
+        }
 
         if (n.rfind("lib/arm64-v8a/", 0) == 0 && n.size() > 14 &&
             n.back() != '/') {
@@ -633,12 +640,23 @@ static bool extractXapk(const std::string& xapk_path, const std::string& dest_di
         std::string n = name;
         bool isApk = n.size() > 4 && n.compare(n.size() - 4, 4, ".apk") == 0 && n.back() != '/';
         if (isApk) {
-            if (n.find("config.x86") != std::string::npos) {
-                compatLogFmt("xapk: skip %s (x86 split)", n.c_str());
-            } else {   // arm64 split → lib/, armeabi split → lib32/ (both via extractApk)
-                compatLogFmt("xapk: unpack %s", n.c_str());
+            // Only the base APK, the arm64/armeabi lib splits, and Unity asset
+            // packs carry anything we need. Skipping the per-language/-density
+            // config splits (config.en/config.hdpi/…) and x86 avoids a pile of
+            // pointless temp-file round-trips to the SD card.
+            bool isConfig = n.find("config.") != std::string::npos;
+            bool wanted = !isConfig
+                        || n.find("config.arm64_v8a") != std::string::npos
+                        || n.find("config.armeabi")   != std::string::npos;
+            if (!wanted) {
+                compatLogFmt("xapk: skip %s (resource split)", n.c_str());
+            } else {
+                compatLogFmt("xapk: unpack %s (%lu KB)...", n.c_str(), (unsigned long)(fi.uncompressed_size/1024));
+                compatLogFlush();                      // so progress is on disk before the (slow) extract
                 if (cb) cb("Installing XAPK", n.c_str());
                 if (extractEntry(zf, tmp) && extractApk(tmp, dest_dir, cb)) { any = true; done++; }
+                compatLogFmt("xapk: unpacked %s", n.c_str());
+                compatLogFlush();
             }
         }
         if (i + 1 < gi.number_entry && unzGoToNextFile(zf) != UNZ_OK) break;
@@ -646,6 +664,7 @@ static bool extractXapk(const std::string& xapk_path, const std::string& dest_di
     unzClose(zf);
     remove(tmp.c_str());
     compatLogFmt("xapk: done (%d apk(s) merged)", done);
+    compatLogFlush();
     return any;
 }
 
