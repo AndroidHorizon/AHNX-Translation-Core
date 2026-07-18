@@ -179,6 +179,25 @@ int main() {
     // udiv r0,r1,r2 (r1=100, r2=7 → 14)
     { CpuState c = runT({0xfbb1,0xf0f2, 0x4770}, 0, 100, 7); check("t2 udiv", c.r[0], 14); }
 
+    // ── VFP (float): vmov s0,r0; vmov s1,r1; OP s2,s0,s1; vmov r0,s2 ──
+    const uint32_t F3=0x40400000, F2=0x40000000;
+    { CpuState c = runT({0xee00,0x0a10 /*vmov s0,r0*/, 0xee00,0x1a90 /*vmov s1,r1*/,
+                         0xee30,0x1a20 /*vadd.f32 s2,s0,s1*/, 0xee11,0x0a10 /*vmov r0,s2*/, 0x4770}, F3, F2);
+      check("vfp vadd (3+2=5)", c.r[0], 0x40a00000u); }
+    { CpuState c = runT({0xee00,0x0a10, 0xee00,0x1a90, 0xee30,0x1a60 /*vsub*/, 0xee11,0x0a10, 0x4770}, F3, F2);
+      check("vfp vsub (3-2=1)", c.r[0], 0x3f800000u); }
+    { CpuState c = runT({0xee00,0x0a10, 0xee00,0x1a90, 0xee20,0x1a20 /*vmul*/, 0xee11,0x0a10, 0x4770}, F3, F2);
+      check("vfp vmul (3*2=6)", c.r[0], 0x40c00000u); }
+    // vcvt.f32.s32 s0,s0 then back: int 7 → float 7.0
+    { CpuState c = runT({0xee00,0x0a10 /*vmov s0,r0*/, 0xeeb8,0x0ac0 /*vcvt.f32.s32 s0,s0*/,
+                         0xee10,0x0a10 /*vmov r0,s0*/, 0x4770}, 7);
+      check("vfp vcvt int->float", c.r[0], 0x40e00000u /*7.0f*/); }
+    // vldr/vstr round trip: store f2u(5.0) via r0→s0→mem→s1→r1
+    { CpuState c = runT({0xee00,0x0a10 /*vmov s0,r0*/, 0xed81,0x0a00 /*vstr s0,[r1]*/,
+                         0xed91,0x1a00 /*vldr s2,[r1]? */, 0x4770}, 0x40a00000u, 0x1000);
+      // read back what's in memory at 0x1000
+      check("vfp vstr mem", *(uint32_t*)(g_base+0x1000), 0x40a00000u); }
+
     printf("\narm32 harness: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -5,6 +5,8 @@
 #include "arm32/arm32_internal.h"
 #include "compat/loader.h"
 #include <switch.h>
+#include <cmath>
+#include <cstring>
 
 namespace a32 {
 
@@ -69,6 +71,130 @@ static uint32_t shiftImm(CpuState& c, uint32_t val, uint32_t type, uint32_t amt,
     (void)setc; return val;
 }
 
+// ── VFP (floating point) ────────────────────────────────────────────────────
+// The VFP encoding is identical between ARM and Thumb-2 (Thumb just forces
+// cond=AL), so both paths build an ARM-style 32-bit word and call execVFP.
+static inline float  u2f(uint32_t u){ float f; memcpy(&f,&u,4); return f; }
+static inline uint32_t f2u(float f){ uint32_t u; memcpy(&u,&f,4); return u; }
+static inline double u2d(uint64_t u){ double d; memcpy(&d,&u,8); return d; }
+static inline uint64_t d2u(double d){ uint64_t u; memcpy(&u,&d,8); return u; }
+
+static uint32_t getS(CpuState& c, uint32_t n){ return (uint32_t)(c.vfp[n>>1] >> ((n&1)*32)); }
+static void     setS(CpuState& c, uint32_t n, uint32_t v){
+    uint64_t& d = c.vfp[n>>1]; uint32_t sh=(n&1)*32;
+    d = (d & ~(0xFFFFFFFFull<<sh)) | ((uint64_t)v<<sh);
+}
+
+// VFP condition flags live in FPSCR; mirror them into a small store and copy to
+// CPSR on VMRS APSR_nzcv.
+static uint32_t g_fpscr_nzcv = 0;
+
+static bool execVFP(CpuState& c, uint32_t w) {
+    uint32_t cpn = (w >> 8) & 0xF;               // coprocessor 10 (F32) / 11 (F64)
+    if (cpn != 10 && cpn != 11) return false;
+    bool dp = (cpn == 11);                        // double precision
+
+    // VLDR / VSTR / VLDM / VSTM (bits 27-25 == 110)
+    if ((w & 0x0E000000) == 0x0C000000) {
+        bool P=(w>>24)&1, U=(w>>23)&1, Wb=(w>>21)&1, L=(w>>20)&1;
+        uint32_t rn=(w>>16)&0xF, vd=(w>>12)&0xF, imm8=w&0xFF;
+        uint32_t D=(w>>22)&1;
+        if (P && !Wb) {                           // VLDR/VSTR (single reg)
+            uint32_t addr = U ? c.r[rn]+imm8*4 : c.r[rn]-imm8*4;
+            if (dp) { uint32_t d=(D<<4)|vd; if(L) c.vfp[d]=((uint64_t)rd32(addr+4)<<32)|rd32(addr); else { wr32(addr,(uint32_t)c.vfp[d]); wr32(addr+4,(uint32_t)(c.vfp[d]>>32)); } }
+            else    { uint32_t s=(vd<<1)|D; if(L) setS(c,s,rd32(addr)); else wr32(addr,getS(c,s)); }
+            return true;
+        }
+        // VLDM/VSTM
+        uint32_t regs = dp ? (imm8/2) : imm8;
+        uint32_t addr = U ? c.r[rn] : c.r[rn]-imm8*4;
+        uint32_t first = dp ? ((D<<4)|vd) : ((vd<<1)|D);
+        for (uint32_t i=0;i<regs;i++) {
+            if (dp) { uint32_t d=first+i; if(L) c.vfp[d]=((uint64_t)rd32(addr+4)<<32)|rd32(addr); else { wr32(addr,(uint32_t)c.vfp[d]); wr32(addr+4,(uint32_t)(c.vfp[d]>>32)); } addr+=8; }
+            else    { uint32_t s=first+i; if(L) setS(c,s,rd32(addr)); else wr32(addr,getS(c,s)); addr+=4; }
+        }
+        if (Wb) c.r[rn] = U ? c.r[rn]+imm8*4 : c.r[rn]-imm8*4;
+        return true;
+    }
+
+    // VMOV core <-> single, VMOV core-pair <-> double, VMSR/VMRS (bits 27-24==1110, bit4==1)
+    if ((w & 0x0F000010) == 0x0E000010) {
+        bool toArm=(w>>20)&1;
+        if (((w>>21)&0x7)==0 && ((w>>8)&0xF)==10) {          // VMOV Sn,Rt / Rt,Sn
+            uint32_t sn=((w>>16)&0xF)<<1 | ((w>>7)&1), rt=(w>>12)&0xF;
+            if (toArm) c.r[rt]=getS(c,sn); else setS(c,sn,c.r[rt]);
+            return true;
+        }
+        if (((w>>21)&0x7)==7) {                               // VMRS/VMSR
+            uint32_t rt=(w>>12)&0xF;
+            if (toArm) { if(rt==15) c.cpsr=(c.cpsr&~0xF0000000u)|(g_fpscr_nzcv&0xF0000000u); else c.r[rt]=g_fpscr_nzcv; }
+            else g_fpscr_nzcv=c.r[rt];
+            return true;
+        }
+    }
+    // VMOV core-pair <-> double/two-single (bits 27-21 == 1100 010)
+    if ((w & 0x0FE00000) == 0x0C400000) {
+        bool toArm=(w>>20)&1; uint32_t rt=(w>>12)&0xF, rt2=(w>>16)&0xF;
+        if ((w>>8&0xF)==11) { uint32_t d=((w>>5&1)<<4)|(w&0xF);
+            if (toArm){ c.r[rt]=(uint32_t)c.vfp[d]; c.r[rt2]=(uint32_t)(c.vfp[d]>>32);} else c.vfp[d]=((uint64_t)c.r[rt2]<<32)|c.r[rt]; }
+        else { uint32_t m=((w&0xF)<<1)|((w>>5)&1);
+            if (toArm){ c.r[rt]=getS(c,m); c.r[rt2]=getS(c,m+1);} else { setS(c,m,c.r[rt]); setS(c,m+1,c.r[rt2]); } }
+        return true;
+    }
+
+    // VFP data processing (bits 27-24 == 1110). The opcode is {bit23,bit21,bit20}
+    // (bit22 is the D register bit), plus bit6.
+    if ((w & 0x0F000000) == 0x0E000000) {
+        uint32_t D=(w>>22)&1, vn=(w>>16)&0xF, vd=(w>>12)&0xF, N=(w>>7)&1, M=(w>>5)&1, vm=w&0xF;
+        uint32_t o = (((w>>23)&1)<<2) | (((w>>21)&1)<<1) | ((w>>20)&1), op6=(w>>6)&1;
+        uint32_t d = dp?((D<<4)|vd):((vd<<1)|D), n = dp?((N<<4)|vn):((vn<<1)|N), m = dp?((M<<4)|vm):((vm<<1)|M);
+        auto rN=[&](uint32_t r){ return dp?u2d(c.vfp[r]):(double)u2f(getS(c,r)); };
+        auto wD=[&](double v){ if(dp) c.vfp[d]=d2u(v); else setS(c,d,f2u((float)v)); };
+        switch (o) {
+            case 0: wD(rN(d) + (op6 ? -(rN(n)*rN(m)) : (rN(n)*rN(m)))); return true;  // VMLA/VMLS
+            case 2: wD(rN(n)*rN(m)); return true;                                     // VMUL
+            case 3: wD(op6 ? rN(n)-rN(m) : rN(n)+rN(m)); return true;                 // VADD/VSUB
+            case 4: wD(rN(n)/rN(m)); return true;                                     // VDIV
+            case 7: {                                                                // extension family
+                uint32_t opc2=vn, opc3=(w>>6)&3;
+                if (opc3 == 0) break;                       // VMOV immediate — rare, log
+                switch (opc2) {
+                    case 0x0: wD((opc3&2) ? fabs(rN(m)) : rN(m)); return true;         // VABS / VMOV reg
+                    case 0x1: wD((opc3&2) ? sqrt(rN(m)) : -rN(m)); return true;        // VSQRT / VNEG
+                    case 0x4: case 0x5: {                                             // VCMP / VCMPE
+                        double a=rN(d), b=(opc2==5)?0.0:rN(m);
+                        g_fpscr_nzcv = (a==b)?0x60000000u : (a<b)?0x80000000u : 0x20000000u;
+                        return true;
+                    }
+                    case 0x7: if (opc3&2) {                                           // VCVT double<->single
+                        if (dp) setS(c,(vd<<1)|D, f2u((float)u2d(c.vfp[(M<<4)|vm])));
+                        else    c.vfp[(D<<4)|vd] = d2u((double)u2f(getS(c,(vm<<1)|M)));
+                        return true;
+                    } break;
+                    case 0x8: {                                                       // VCVT int->float (Sm)
+                        int32_t iv=(int32_t)getS(c,(vm<<1)|M); bool uns=!op6;
+                        wD(uns ? (double)(uint32_t)iv : (double)iv); return true;
+                    }
+                    case 0xC: case 0xD: {                                             // VCVT float->int (to Sd)
+                        double v=rN(m); bool uns=(opc2==0xC);
+                        setS(c,(vd<<1)|D, uns ? (uint32_t)(v<0?0:v) : (uint32_t)(int32_t)v);
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    compatLogFmt("arm32: UNIMPL VFP 0x%08x", w);
+    return false;
+}
+// Is this ARM-style word a VFP/coproc-10/11 load-store or data-processing insn?
+static inline bool isVFP(uint32_t w) {
+    uint32_t cpn = (w >> 8) & 0xF;
+    if (cpn != 10 && cpn != 11) return false;
+    return (w & 0x0E000000) == 0x0C000000 || (w & 0x0F000000) == 0x0E000000;
+}
+
 // Shift by a register amount (differs from immediate at boundary cases).
 static uint32_t shiftReg(CpuState& c, uint32_t val, uint32_t type, uint32_t amt, bool& carry) {
     carry = cf(c);
@@ -89,6 +215,9 @@ static void stepArm(CpuState& c) {
     c.r[15] = pc + 4;                       // default advance; PC reads as +8 in ARM
     uint32_t cond = insn >> 28;
     if (cond != 0xF && !condPass(c, cond)) return;
+
+    // VFP / coprocessor 10-11
+    if (isVFP(insn)) { if (execVFP(c, insn)) return; c.halt = true; c.halt_pc = pc; return; }
 
     // Branch / BL (cond 101)
     if ((insn & 0x0E000000) == 0x0A000000) {
@@ -253,6 +382,10 @@ static uint32_t thumbExpandImm(uint32_t imm12, CpuState& c, bool& carry) {
 static void stepThumb32(CpuState& c, uint32_t pc, uint16_t hw1) {
     uint16_t hw2 = rd16(pc + 2);
     c.r[15] = pc + 4;
+
+    // VFP / coprocessor 10-11 (same layout as ARM once the halfwords are joined)
+    { uint32_t w = ((uint32_t)hw1 << 16) | hw2;
+      if (isVFP(w)) { if (execVFP(c, w)) return; c.halt = true; c.halt_pc = pc; return; } }
 
     // ── Branches & misc control (11110 ... 1x) ──
     if ((hw1 & 0xF800) == 0xF000 && (hw2 & 0x8000)) {
