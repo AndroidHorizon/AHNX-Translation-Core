@@ -6,6 +6,9 @@
 #include "compat/loader.h"
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
+#include <cctype>
+#include <strings.h>
 #include <vector>
 #include <string>
 
@@ -98,6 +101,78 @@ static bool dispatch(CpuState& c, const char* name, uint32_t& ret) {
         !strcmp(name, "__register_atfork") || !strcmp(name, "atexit")) { ret = 0; return true; }
     if (!strcmp(name, "__cxa_guard_acquire")) { uint8_t* g = (uint8_t*)hptr(arg(c,0)); ret = g && *g ? 0 : 1; return true; }
     if (!strcmp(name, "__cxa_guard_release")) { uint8_t* g = (uint8_t*)hptr(arg(c,0)); if (g) *g = 1; ret = 0; return true; }
+
+    // ── more string / mem (all bounded to the region) ──
+    if (!strcmp(name,"strnlen")) { uint32_t L=gStrlen(arg(c,0)), n=arg(c,1); ret = L<n?L:n; return true; }
+    if (!strcmp(name,"strrchr")) { uint32_t s=arg(c,0),L=gStrlen(s),f=0; uint8_t ch=(uint8_t)arg(c,1);
+        for(uint32_t i=0;i<L;i++) if(((uint8_t*)hptr(s))[i]==ch) f=s+i; ret=f; return true; }
+    if (!strcmp(name,"memchr")) { uint32_t s=arg(c,0),n=arg(c,2); void* p=(s&&guestValid(s,n))?memchr(hptr(s),(int)arg(c,1),n):nullptr; ret=p?toGuest(p):0; return true; }
+    if (!strcmp(name,"strstr")) { uint32_t h=arg(c,0),ne=arg(c,1); if(!h||!ne){ret=0;return true;} gStrlen(h); gStrlen(ne); char* p=strstr(hstr(h),hstr(ne)); ret=p?toGuest(p):0; return true; }
+    if (!strcmp(name,"strcasecmp")||!strcmp(name,"strncasecmp")) {
+        uint32_t a=arg(c,0),b=arg(c,1); uint32_t n=name[6]=='n'?arg(c,2):(gStrlen(a)+1);
+        ret=(!a||!b)?(a==b?0:1):(uint32_t)strncasecmp(hstr(a),hstr(b),n); return true; }
+    if (!strcmp(name,"strdup")) { uint32_t s=arg(c,0),L=gStrlen(s),p=guestAlloc(L+1);
+        if(p){ if(L) memcpy(hptr(p),hptr(s),L); ((char*)hptr(p))[L]=0; } ret=p; return true; }
+    if (!strcmp(name,"strncat")) { uint32_t d=arg(c,0),s=arg(c,1),n=arg(c,2),sl=gStrlen(s),dl=gStrlen(d);
+        uint32_t cp=sl<n?sl:n; gStrcpy(d+dl,s,cp); if(guestValid(d+dl+cp,1)) ((char*)hptr(d+dl+cp))[0]=0; ret=d; return true; }
+
+    // ── ctype / conversion ──
+    if (!strcmp(name,"toupper")) { ret=(uint32_t)toupper((int)arg(c,0)); return true; }
+    if (!strcmp(name,"tolower")) { ret=(uint32_t)tolower((int)arg(c,0)); return true; }
+    if (!strcmp(name,"isalpha")) { ret=isalpha((int)arg(c,0))?1:0; return true; }
+    if (!strcmp(name,"isdigit")) { ret=isdigit((int)arg(c,0))?1:0; return true; }
+    if (!strcmp(name,"isspace")) { ret=isspace((int)arg(c,0))?1:0; return true; }
+    if (!strcmp(name,"atoi"))    { { char* s=hstr(arg(c,0)); ret=(uint32_t)atoi(s?s:""); } return true; }
+    if (!strcmp(name,"strtol")||!strcmp(name,"strtoul")) {
+        char* s=hstr(arg(c,0)); ret = s?(uint32_t)strtoul(s,nullptr,(int)arg(c,2)):0; return true; }
+
+    // ── math: softfp ABI — double args in r0:r1 (and r2:r3), returned in r0:r1 ──
+    {
+        auto argD=[&](int r)->double{ uint64_t b=(uint64_t)arg(c,r)|((uint64_t)arg(c,r+1)<<32); double d; memcpy(&d,&b,8); return d; };
+        auto retD=[&](double d){ uint64_t b; memcpy(&b,&d,8); ret=(uint32_t)b; c.r[1]=(uint32_t)(b>>32); };
+        auto argF=[&](int r)->float{ uint32_t u=arg(c,r); float f; memcpy(&f,&u,4); return f; };
+        auto retF=[&](float f){ uint32_t u; memcpy(&u,&f,4); ret=u; };
+        double x=argD(0);
+        if (!strcmp(name,"sqrt")) { retD(sqrt(x)); return true; }
+        if (!strcmp(name,"sin"))  { retD(sin(x)); return true; }
+        if (!strcmp(name,"cos"))  { retD(cos(x)); return true; }
+        if (!strcmp(name,"tan"))  { retD(tan(x)); return true; }
+        if (!strcmp(name,"asin")) { retD(asin(x)); return true; }
+        if (!strcmp(name,"acos")) { retD(acos(x)); return true; }
+        if (!strcmp(name,"atan")) { retD(atan(x)); return true; }
+        if (!strcmp(name,"exp"))  { retD(exp(x)); return true; }
+        if (!strcmp(name,"log"))  { retD(log(x)); return true; }
+        if (!strcmp(name,"log10")){ retD(log10(x)); return true; }
+        if (!strcmp(name,"floor")){ retD(floor(x)); return true; }
+        if (!strcmp(name,"ceil")) { retD(ceil(x)); return true; }
+        if (!strcmp(name,"round")){ retD(round(x)); return true; }
+        if (!strcmp(name,"fabs")) { retD(fabs(x)); return true; }
+        if (!strcmp(name,"atan2")){ retD(atan2(x, argD(2))); return true; }
+        if (!strcmp(name,"pow"))  { retD(pow(x, argD(2))); return true; }
+        if (!strcmp(name,"fmod")) { retD(fmod(x, argD(2))); return true; }
+        if (!strcmp(name,"hypot")){ retD(hypot(x, argD(2))); return true; }
+        // float variants (arg/ret in r0)
+        float xf=argF(0);
+        if (!strcmp(name,"sqrtf")){ retF(sqrtf(xf)); return true; }
+        if (!strcmp(name,"sinf")) { retF(sinf(xf)); return true; }
+        if (!strcmp(name,"cosf")) { retF(cosf(xf)); return true; }
+        if (!strcmp(name,"fabsf")){ retF(fabsf(xf)); return true; }
+        if (!strcmp(name,"floorf")){ retF(floorf(xf)); return true; }
+        if (!strcmp(name,"ceilf")){ retF(ceilf(xf)); return true; }
+        if (!strcmp(name,"powf")) { retF(powf(xf, argF(1))); return true; }
+        if (!strcmp(name,"atan2f")){ retF(atan2f(xf, argF(1))); return true; }
+    }
+
+    // ── libc misc ──
+    if (!strcmp(name,"abort") || !strcmp(name,"exit") || !strcmp(name,"_exit")) {
+        compatLogFmt("arm32: guest called %s(%d) — stopping", name, arg(c,0));
+        c.halt = true; c.halt_pc = c.r[15]; ret = 0; return true;
+    }
+    if (!strcmp(name,"getenv"))  { ret = 0; return true; }         // no env
+    if (!strcmp(name,"rand"))    { ret = (uint32_t)rand(); return true; }
+    if (!strcmp(name,"srand"))   { srand(arg(c,0)); ret = 0; return true; }
+    if (!strcmp(name,"time"))    { uint32_t p=arg(c,0); if(p && guestValid(p,4)) *(uint32_t*)toHost(p)=0; ret = 0; return true; }
+    if (!strcmp(name,"malloc_usable_size")) { ret = 0; return true; }
 
     return false;
 }
