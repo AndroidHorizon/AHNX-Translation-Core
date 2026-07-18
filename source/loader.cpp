@@ -12,6 +12,7 @@
 #include <minizip/unzip.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <strings.h>
 #include <cstring>
 #include <cstdio>
@@ -256,6 +257,24 @@ static void mkdirp(const std::string& path) {
         if (c == '/') mkdir(p.c_str(), 0777);
     }
     mkdir(path.c_str(), 0777);
+}
+
+// Recursively delete a directory (used to clear a stale install when a different
+// build of the same package is launched).
+static void rmTree(const std::string& path) {
+    DIR* d = opendir(path.c_str());
+    if (!d) { remove(path.c_str()); return; }
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        std::string child = path + "/" + n;
+        struct stat st;
+        if (stat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) rmTree(child);
+        else remove(child.c_str());
+    }
+    closedir(d);
+    rmdir(path.c_str());
 }
 
 // Extract a single ZIP entry to a file path
@@ -701,6 +720,29 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     g_fps_cap_stored = readFpsCap(base_dir);
     compatLogFmt("launchApk: fps cap=%s",
                  g_fps_cap_stored > 0 ? std::to_string(g_fps_cap_stored).c_str() : "none (default)");
+
+    // Two builds of one game share a package → share this dir. If the cached
+    // install came from a different file, wipe it and re-extract so we don't run
+    // stale libs of the wrong arch/version (e.g. arm64 1.67 vs arm32 1.70).
+    if (already_installed) {
+        std::string installedFrom;
+        if (FILE* mf = fopen((base_dir + "/.installed").c_str(), "r")) {
+            char b[512] = {0};
+            if (fgets(b, sizeof(b), mf)) installedFrom = b;
+            fclose(mf);
+            while (!installedFrom.empty() && (installedFrom.back()=='\n' || installedFrom.back()=='\r'))
+                installedFrom.pop_back();
+        }
+        if (installedFrom != apk_path) {
+            compatLogFmt("launchApk: cached install is from '%s' but launching '%s' — re-extracting",
+                         installedFrom.c_str(), apk_path.c_str());
+            rmTree(lib_dir);
+            rmTree(base_dir + "/lib32");
+            rmTree(asset_dir);
+            mkdirp(lib_dir); mkdirp(asset_dir);
+            already_installed = false;
+        }
+    }
 
     // ── 2. Extract APK (skipped when already installed) ──────────────────────
     if (!already_installed) {

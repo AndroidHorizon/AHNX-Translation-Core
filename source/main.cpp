@@ -1222,10 +1222,24 @@ int main(int argc, char** argv) {
 
     const char* wantPkg = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : nullptr;
     int idx = -1;
-    if (wantPkg) {
-        for (size_t i = 0; i < app.apks.size(); i++) {
+
+    // The launcher records the exact file it chose (two builds of one game can
+    // share a package id). Prefer that so we launch the right one.
+    std::string wantPath;
+    if (FILE* lm = fopen("sdmc:/Viridite/.launch_apk", "r")) {
+        char b[512] = {0};
+        if (fgets(b, sizeof(b), lm)) wantPath = b;
+        fclose(lm);
+        while (!wantPath.empty() && (wantPath.back() == '\n' || wantPath.back() == '\r')) wantPath.pop_back();
+    }
+    if (!wantPath.empty()) {
+        for (size_t i = 0; i < app.apks.size(); i++)
+            if (app.apks[i].path == wantPath) { idx = (int)i; break; }
+        if (idx >= 0) logMsg(("core-x64: launch target -> " + wantPath).c_str());
+    }
+    if (idx < 0 && wantPkg) {
+        for (size_t i = 0; i < app.apks.size(); i++)
             if (app.apks[i].packageName == wantPkg) { idx = (int)i; break; }
-        }
     }
 
     if (idx < 0) {
