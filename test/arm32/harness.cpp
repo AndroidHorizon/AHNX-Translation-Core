@@ -22,6 +22,11 @@ uint8_t* toHost(uint32_t g) { return g_base + g; }
 uint32_t toGuest(const void* h) { return (uint32_t)((const uint8_t*)h - g_base); }
 bool guestValid(uint32_t a, uint32_t l) { return g_base && (uint64_t)a + l <= g_region; }
 uint32_t bridgeRegister(const char*) { return A32_SENTINEL_BASE; }
+// Simple bump allocator for tests (real one is in arm32_mem.cpp).
+static uint32_t s_heap = 0x08000000;
+uint32_t guestAlloc(uint32_t n) { uint32_t p = s_heap; s_heap += (n + 15) & ~15u; return p; }
+void guestFree(uint32_t) {}
+uint32_t guestRealloc(uint32_t p, uint32_t) { return p; }
 // Test bridge: r0 = 0xB0000000 | (import idx) so tests can see a call happened.
 void bridgeCall(CpuState& c, uint32_t sentinel) {
     c.r[0] = 0xB0000000u | ((sentinel - A32_SENTINEL_BASE) / 4);
@@ -53,7 +58,7 @@ static void check(const char* name, uint32_t got, uint32_t want) {
 }
 
 int main() {
-    g_region = 16 * 1024 * 1024;
+    g_region = A32_REGION_SIZE;
     g_base = (uint8_t*)calloc(1, g_region);
 
     // ── ARM: MOV imm, ADD imm, BX lr ──
@@ -213,6 +218,13 @@ int main() {
     // ARM CLZ: r1=0x00010000 → 15
     { uint32_t p[] = {0xe3a01801 /*mov r1,#0x10000*/, 0xe16f0f11 /*clz r0,r1*/, 0xe12fff1e};
       CpuState c = runProg(p, 3, false); check("arm clz", c.r[0], 15); }
+
+    // ── SVC mprotect (r7=125): mov r7,#125; svc #0; → r0=0 (success) ──
+    { uint32_t p[] = {0xe3a0707d /*mov r7,#0x7d*/, 0xef000000 /*svc #0*/, 0xe12fff1e};
+      CpuState c = runProg(p, 3, false); check("svc mprotect", c.r[0], 0); }
+    // ── SVC mmap2 (r7=192, r1=len): returns a guest heap pointer (nonzero) ──
+    { uint32_t p[] = {0xe3a070c0 /*mov r7,#192*/, 0xe3a01a01 /*mov r1,#0x1000*/, 0xef000000, 0xe12fff1e};
+      CpuState c = runProg(p, 4, false); check("svc mmap2 nonzero", c.r[0]!=0 && c.r[0]!=0xffffffff ? 1u : 0u, 1); }
 
     printf("\narm32 harness: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

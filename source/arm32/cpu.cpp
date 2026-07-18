@@ -192,6 +192,41 @@ static bool execVFP(CpuState& c, uint32_t w) {
     compatLogFmt("arm32: UNIMPL VFP 0x%08x", w);
     return false;
 }
+// ── Linux ARM (EABI) syscalls via SVC #0 (number in r7, args r0-r6) ─────────
+// Bionic and the CRT issue raw syscalls during init. Handle the common ones;
+// stub the rest to 0 + log (rate-limited) so execution continues to the next
+// real blocker rather than halting on every unknown number.
+uint32_t g_tls = 0;   // ARM thread pointer (set via __ARM_NR_set_tls, read via CP15 c13)
+static void execSyscall(CpuState& c) {
+    uint32_t nr = c.r[7];
+    switch (nr) {
+        case 4:   /*write*/   { uint32_t fd=c.r[0], n=c.r[2]; if(fd==1||fd==2){ char*s=(char*)toHost(c.r[1]); if(guestValid(c.r[1],n)){ static char b[256]; uint32_t m=n<255?n:255; memcpy(b,s,m); b[m]=0; compatLogFmt("arm32 guest: %s", b);} } c.r[0]=n; return; }
+        case 20:  /*getpid*/  c.r[0]=1; return;
+        case 45:  /*brk*/     c.r[0]=0; return;      // malloc uses the guest allocator, not brk
+        case 78:  /*gettimeofday*/ { if(guestValid(c.r[0],8)){ uint64_t us=armTicksToNs(armGetSystemTick())/1000; wr32(c.r[0],(uint32_t)(us/1000000)); wr32(c.r[0]+4,(uint32_t)(us%1000000)); } c.r[0]=0; return; }
+        case 91:  /*munmap*/  c.r[0]=0; return;
+        case 120: /*clone*/   compatLog("arm32: clone (thread) — not supported yet, returning EAGAIN"); c.r[0]=(uint32_t)-11; return;
+        case 122: /*uname*/   c.r[0]=0; return;
+        case 125: /*mprotect*/c.r[0]=0; return;      // guest memory is all RW in our region
+        case 146: /*writev*/  { uint32_t iov=c.r[1], cnt=c.r[2], tot=0; for(uint32_t i=0;i<cnt;i++){ uint32_t len=rd32(iov+i*8+4); tot+=len; } c.r[0]=tot; return; }
+        case 162: /*nanosleep*/ c.r[0]=0; return;
+        case 174: /*rt_sigaction*/ case 175: /*rt_sigprocmask*/ case 186: /*sigaltstack*/ c.r[0]=0; return;
+        case 192: /*mmap2*/   { uint32_t len=c.r[1]; uint32_t p=guestAlloc(len); if(p && guestValid(p,len)) memset(toHost(p),0,len); c.r[0]=p?p:(uint32_t)-1; return; }
+        case 199: /*getuid32*/ case 200: /*getgid32*/ case 201: /*geteuid32*/ case 202: /*getegid32*/ c.r[0]=0; return;
+        case 220: /*madvise*/ c.r[0]=0; return;
+        case 224: /*gettid*/  c.r[0]=1; return;
+        case 240: /*futex*/   c.r[0]=0; return;      // single-threaded: never contended
+        case 248: /*exit_group*/ case 1: /*exit*/ compatLog("arm32: guest exit"); c.halt=true; c.halt_pc=c.r[15]; return;
+        case 263: /*clock_gettime*/ { if(guestValid(c.r[1],8)){ uint64_t ns=armTicksToNs(armGetSystemTick()); wr32(c.r[1],(uint32_t)(ns/1000000000ull)); wr32(c.r[1]+4,(uint32_t)(ns%1000000000ull)); } c.r[0]=0; return; }
+        case 0xf0002: /*__ARM_NR_cacheflush*/ c.r[0]=0; return;
+        case 0xf0005: /*__ARM_NR_set_tls*/ g_tls=c.r[0]; c.r[0]=0; return;
+        default: {
+            static int warned=0; if(warned<80){ warned++; compatLogFmt("arm32: UNIMPL syscall %u (0x%x) r0=0x%x pc=0x%x", nr, nr, c.r[0], c.r[15]); }
+            c.r[0]=0; return;
+        }
+    }
+}
+
 // Is this ARM-style word a VFP/coproc-10/11 load-store or data-processing insn?
 static inline bool isVFP(uint32_t w) {
     uint32_t cpn = (w >> 8) & 0xF;
@@ -230,6 +265,18 @@ static void stepArm(CpuState& c) {
     if ((insn & 0x0FFF0FF0) == 0x06BF0F30) { uint32_t rd=(insn>>12)&0xF; c.r[rd]=__builtin_bswap32(c.r[insn&0xF]); return; }
     if ((insn & 0x0FFF0FF0) == 0x06BF0FB0) { uint32_t rd=(insn>>12)&0xF, v=c.r[insn&0xF]; c.r[rd]=((v&0xFF00FF00)>>8)|((v&0x00FF00FF)<<8); return; }
     if ((insn & 0x0FFF0FF0) == 0x06FF0FB0) { uint32_t rd=(insn>>12)&0xF; c.r[rd]=(int32_t)(int16_t)__builtin_bswap16((uint16_t)c.r[insn&0xF]); return; }
+
+    // SVC / SWI (syscall) — cond 1111 imm24
+    if ((insn & 0x0F000000) == 0x0F000000) { execSyscall(c); return; }
+
+    // Coprocessor 15 (system control): TLS read (TPIDRURO) + barriers/cache (nop)
+    if ((insn & 0x0F000010) == 0x0E000010 && ((insn >> 8) & 0xF) == 15) {
+        if ((insn >> 20) & 1) {                      // MRC (read into Rd)
+            uint32_t rd=(insn>>12)&0xF, crn=(insn>>16)&0xF, op2=(insn>>5)&7;
+            c.r[rd] = (crn==13 && op2==3) ? g_tls : 0;   // c13,c0,3 = thread pointer
+        }
+        return;                                      // MCR (barrier/cache) = no-op
+    }
 
     // Branch / BL (cond 101)
     if ((insn & 0x0E000000) == 0x0A000000) {
@@ -670,11 +717,12 @@ static void stepThumb(CpuState& c) {
         c.r[15] = pc + 4 + off;
         return;
     }
-    // Conditional branch B<cc>
+    // Conditional branch B<cc> — and SVC (0xDF__), UDF (0xDE__)
     if ((op & 0xF000) == 0xD000) {
         uint32_t cond = (op>>8)&0xF;
-        if (cond == 0xE || cond == 0xF) { /* undef/SVC */ }
-        else if (condPass(c, cond)) { int32_t off=((int32_t)(op&0xFF)<<24)>>23; c.r[15]=pc+4+off; }
+        if (cond == 0xF) { execSyscall(c); return; }               // SVC
+        if (cond == 0xE) { /* UDF permanently undefined */ return; }
+        if (condPass(c, cond)) { int32_t off=((int32_t)(op&0xFF)<<24)>>23; c.r[15]=pc+4+off; }
         return;
     }
     // MOV/CMP/ADD/SUB immediate (001xx)
