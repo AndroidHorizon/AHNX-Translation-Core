@@ -230,24 +230,211 @@ static void stepArm(CpuState& c) {
     c.halt = true; c.halt_pc = pc;
 }
 
-// ── Thumb step (16-bit + BL/BLX 32-bit prefix) ──────────────────────────────
+// Thumb ExpandImm_C (12-bit modified immediate → 32-bit).
+static uint32_t thumbExpandImm(uint32_t imm12, CpuState& c, bool& carry) {
+    carry = cf(c);
+    if ((imm12 & 0xC00) == 0) {               // imm12[11:10] == 00
+        uint32_t imm8 = imm12 & 0xFF;
+        switch ((imm12 >> 8) & 3) {
+            case 0: return imm8;
+            case 1: return (imm8 << 16) | imm8;
+            case 2: return (imm8 << 24) | (imm8 << 8);
+            default: return (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8;
+        }
+    }
+    uint32_t rot = (imm12 >> 7) & 0x1F;
+    uint32_t val = 0x80 | (imm12 & 0x7F);
+    uint32_t r = (val >> rot) | (val << (32 - rot));
+    carry = r >> 31;
+    return r;
+}
+
+// ── Thumb-2 32-bit instruction step ─────────────────────────────────────────
+static void stepThumb32(CpuState& c, uint32_t pc, uint16_t hw1) {
+    uint16_t hw2 = rd16(pc + 2);
+    c.r[15] = pc + 4;
+
+    // ── Branches & misc control (11110 ... 1x) ──
+    if ((hw1 & 0xF800) == 0xF000 && (hw2 & 0x8000)) {
+        uint32_t s = (hw1 >> 10) & 1, j1 = (hw2 >> 13) & 1, j2 = (hw2 >> 11) & 1;
+        uint32_t imm10 = hw1 & 0x3FF, imm11 = hw2 & 0x7FF;
+        if (hw2 & 0x4000) {                    // BL / BLX (hw2[14]=1)
+            uint32_t i1 = (~(j1 ^ s)) & 1, i2 = (~(j2 ^ s)) & 1;
+            int32_t off = (int32_t)((s<<24)|(i1<<23)|(i2<<22)|(imm10<<12)|(imm11<<1));
+            off = (off << 7) >> 7;             // sign-extend 25-bit
+            c.r[14] = (pc + 4) | 1;
+            uint32_t target = pc + 4 + off;
+            if (!(hw2 & 0x1000)) { c.cpsr &= ~C_T; target &= ~3u; }  // BLX
+            c.r[15] = target & ~1u;
+            return;
+        }
+        if (hw2 & 0x1000) {                    // B.W unconditional (T4)
+            uint32_t i1 = (~(j1 ^ s)) & 1, i2 = (~(j2 ^ s)) & 1;
+            int32_t off = (int32_t)((s<<24)|(i1<<23)|(i2<<22)|(imm10<<12)|(imm11<<1));
+            off = (off << 7) >> 7;
+            c.r[15] = pc + 4 + off;
+            return;
+        }
+        // B<cond>.W (T3)
+        uint32_t cond = (hw1 >> 6) & 0xF;
+        int32_t off = (int32_t)((s<<20)|(j2<<19)|(j1<<18)|((hw1&0x3F)<<12)|(imm11<<1));
+        off = (off << 11) >> 11;
+        if (condPass(c, cond)) c.r[15] = pc + 4 + off;
+        return;
+    }
+
+    // ── Data processing (modified immediate) — 11110 x0xxx ... 0 ──
+    if ((hw1 & 0xFA00) == 0xF000 && !(hw2 & 0x8000)) {
+        uint32_t op = (hw1 >> 5) & 0xF, rn = hw1 & 0xF, rd = (hw2 >> 8) & 0xF;
+        bool S = (hw1 >> 4) & 1;
+        uint32_t imm12 = ((hw1 & 0x400) << 1) | ((hw2 >> 4) & 0x700) | (hw2 & 0xFF);
+        bool co; uint32_t imm = thumbExpandImm(imm12, c, co), vn = c.r[rn], r = 0;
+        switch (op) {
+            case 0x0: r = vn & imm; if(rd==15){setNZ(c,r);setC(c,co);return;} break;   // AND/TST
+            case 0x1: r = vn & ~imm; break;                                            // BIC
+            case 0x2: r = vn | imm; break;                                             // ORR/MOV(rn=15)
+            case 0x3: r = vn | ~imm; break;                                            // ORN/MVN
+            case 0x4: r = vn ^ imm; if(rd==15){setNZ(c,r);setC(c,co);return;} break;   // EOR/TEQ
+            case 0x8: r = addWithCarry(c, vn, imm, 0, S); if(rd==15){return;} c.r[rd]=r; if(S)return; return; // ADD/CMN
+            case 0xA: r = addWithCarry(c, vn, imm, cf(c), S); c.r[rd]=r; return;        // ADC
+            case 0xB: r = addWithCarry(c, vn, ~imm, cf(c), S); c.r[rd]=r; return;       // SBC
+            case 0xD: r = addWithCarry(c, vn, ~imm, 1, S); if(rd==15){return;} c.r[rd]=r; return; // SUB/CMP
+            case 0xE: r = addWithCarry(c, ~vn, imm, 1, S); c.r[rd]=r; return;           // RSB
+            default: break;
+        }
+        c.r[rd] = r;
+        if (S) { setNZ(c, r); setC(c, co); }
+        return;
+    }
+
+    // ── Plain binary immediate: MOVW/MOVT, ADDW/SUBW, bitfield — 11110 x1xxx ─
+    if ((hw1 & 0xFA00) == 0xF200 && !(hw2 & 0x8000)) {
+        uint32_t op = (hw1 >> 4) & 0x1F, rn = hw1 & 0xF, rd = (hw2 >> 8) & 0xF;
+        uint32_t i = (hw1 >> 10) & 1, imm3 = (hw2 >> 12) & 7, imm8 = hw2 & 0xFF;
+        if (op == 0x04 || op == 0x0C) {        // MOVW / MOVT
+            uint32_t imm16 = ((hw1 & 0xF) << 12) | (i << 11) | (imm3 << 8) | imm8;
+            if (op == 0x0C) c.r[rd] = (c.r[rd] & 0xFFFF) | (imm16 << 16);   // MOVT
+            else            c.r[rd] = imm16;                                // MOVW
+            return;
+        }
+        if (op == 0x00 || op == 0x0A) {        // ADDW / SUBW (12-bit imm)
+            uint32_t imm = (i << 11) | (imm3 << 8) | imm8;
+            c.r[rd] = (op == 0x0A) ? c.r[rn] - imm : c.r[rn] + imm;
+            return;
+        }
+        uint32_t msb = hw2 & 0x1F, lsb = (imm3 << 2) | ((hw2 >> 6) & 3);
+        if (op == 0x14 || op == 0x1C) {        // SBFX / UBFX
+            uint32_t width = msb + 1, v = c.r[rn] >> lsb;
+            v &= (width >= 32) ? 0xFFFFFFFF : ((1u << width) - 1);
+            if (op == 0x14 && (v & (1u << (width - 1)))) v |= ~((1u << width) - 1);  // sign-extend
+            c.r[rd] = v;
+            return;
+        }
+        if (op == 0x16) {                      // BFI / BFC
+            uint32_t width = msb - lsb + 1, mask = (width>=32?0xFFFFFFFF:((1u<<width)-1)) << lsb;
+            uint32_t src = (rn == 15) ? 0 : c.r[rn];         // BFC when rn==15
+            c.r[rd] = (c.r[rd] & ~mask) | ((src << lsb) & mask);
+            return;
+        }
+    }
+
+    // ── Load/store single, immediate (11111 00x) ──
+    if ((hw1 & 0xFE00) == 0xF800) {
+        uint32_t size = (hw1 >> 5) & 3, L = (hw1 >> 4) & 1;
+        uint32_t rn = hw1 & 0xF, rt = (hw2 >> 12) & 0xF;
+        bool sign = (hw1 >> 8) & 1;
+        uint32_t addr, wback = 0, wbval = 0;
+        if (hw2 & 0x0800) {                    // T4: 8-bit imm, index/wback (bit10=P,9=U,8=W)
+            uint32_t imm8 = hw2 & 0xFF; bool P=(hw2>>10)&1, U=(hw2>>9)&1, W=(hw2>>8)&1;
+            uint32_t off = U ? c.r[rn] + imm8 : c.r[rn] - imm8;
+            addr = P ? off : c.r[rn];
+            if (!P || W) { wback = rn + 1; wbval = off; }
+        } else if (rn == 15) {                 // literal
+            uint32_t imm12 = hw2 & 0xFFF;
+            addr = ((pc + 4) & ~3u) + ((hw1 & 0x80) ? imm12 : (uint32_t)-(int32_t)imm12);
+        } else if ((hw1 & 0x0080)) {           // T3: 12-bit positive imm
+            addr = c.r[rn] + (hw2 & 0xFFF);
+        } else {                               // register offset (T2)
+            uint32_t rm = hw2 & 0xF, sh = (hw2 >> 4) & 3;
+            addr = c.r[rn] + (c.r[rm] << sh);
+        }
+        if (L) {
+            uint32_t v = size==0 ? rd8(addr) : size==1 ? rd16(addr) : rd32(addr);
+            if (sign && size==0) v = (int32_t)(int8_t)v;
+            if (sign && size==1) v = (int32_t)(int16_t)v;
+            c.r[rt] = v;
+        } else {
+            if (size==0) wr8(addr,(uint8_t)c.r[rt]); else if (size==1) wr16(addr,(uint16_t)c.r[rt]); else wr32(addr,c.r[rt]);
+        }
+        if (wback) c.r[wback-1] = wbval;
+        return;
+    }
+
+    // ── Load/store multiple (11101 00) — LDM/STM/PUSH.W/POP.W ──
+    if ((hw1 & 0xFE40) == 0xE800 || (hw1 & 0xFE40) == 0xE900) {
+        bool L=(hw1>>4)&1, U=(hw1>>7)&1, W=(hw1>>5)&1;
+        uint32_t rn=hw1&0xF, list=hw2, n=__builtin_popcount(list);
+        uint32_t addr = U ? c.r[rn] : c.r[rn]-n*4;
+        for (int i=0;i<16;i++) if (list&(1<<i)) { if(L) c.r[i]=rd32(addr); else wr32(addr,c.r[i]); addr+=4; }
+        if (W) c.r[rn] = U ? c.r[rn]+n*4 : c.r[rn]-n*4;
+        if (L && (list&0x8000)) { c.cpsr=(c.r[15]&1)?(c.cpsr|C_T):(c.cpsr&~C_T); c.r[15]&=~1u; }
+        return;
+    }
+
+    // ── Data processing (shifted register) — 11101 01 ──
+    if ((hw1 & 0xFE00) == 0xEA00) {
+        uint32_t op=(hw1>>5)&0xF, rn=hw1&0xF, rd=(hw2>>8)&0xF, rm=hw2&0xF;
+        bool S=(hw1>>4)&1;
+        uint32_t amt=((hw2>>12)&7)<<2 | ((hw2>>6)&3), type=(hw2>>4)&3;
+        bool co; uint32_t opnd=shiftImm(c, c.r[rm], type, amt, S, co), vn=c.r[rn], r=0;
+        switch (op) {
+            case 0x0: r=vn&opnd; if(rd==15){setNZ(c,r);return;} break;      // AND/TST
+            case 0x1: r=vn&~opnd; break;                                    // BIC
+            case 0x2: r=(rn==15)?opnd:(vn|opnd); break;                     // ORR/MOV
+            case 0x3: r=(rn==15)?~opnd:(vn|~opnd); break;                   // ORN/MVN
+            case 0x4: r=vn^opnd; if(rd==15){setNZ(c,r);return;} break;      // EOR/TEQ
+            case 0x8: r=addWithCarry(c,vn,opnd,0,S); if(rd==15)return; break;// ADD/CMN
+            case 0xD: r=addWithCarry(c,vn,~opnd,1,S); if(rd==15)return; break;// SUB/CMP
+            case 0xE: r=addWithCarry(c,~vn,opnd,1,S); break;                // RSB
+            default: c.r[rd]=vn; return;
+        }
+        c.r[rd]=r;
+        if (S && op!=0x8 && op!=0xD && op!=0xE) { setNZ(c,r); setC(c,co); }
+        return;
+    }
+
+    // ── Multiply (11111 0110) — MUL/MLA/MLS ──
+    if ((hw1 & 0xFF80) == 0xFB00) {
+        uint32_t rn=hw1&0xF, ra=(hw2>>12)&0xF, rd=(hw2>>8)&0xF, rm=hw2&0xF, op2=(hw2>>4)&0xF;
+        uint32_t prod=c.r[rn]*c.r[rm];
+        c.r[rd] = (ra==15) ? prod : (op2 ? c.r[ra]-prod : c.r[ra]+prod);  // MUL / MLA / MLS
+        return;
+    }
+    // ── Long multiply / divide (11111 011 1) — UMULL/SMULL/UDIV/SDIV ──
+    if ((hw1 & 0xFF80) == 0xFB80) {
+        uint32_t rn=hw1&0xF, rdlo=(hw2>>12)&0xF, rdhi=(hw2>>8)&0xF, rm=hw2&0xF;
+        uint32_t op=(hw1>>4)&7, op2=(hw2>>4)&0xF;
+        if (op==1 && op2==0xF) { c.r[rdhi] = c.r[rm] ? (uint32_t)((int32_t)c.r[rn]/(int32_t)c.r[rm]) : 0; return; } // SDIV → rdhi is Rd
+        if (op==3 && op2==0xF) { c.r[rdhi] = c.r[rm] ? c.r[rn]/c.r[rm] : 0; return; }                              // UDIV
+        uint64_t res = (op&4) ? (uint64_t)((int64_t)(int32_t)c.r[rn]*(int64_t)(int32_t)c.r[rm])
+                              : (uint64_t)c.r[rn]*(uint64_t)c.r[rm];
+        if (op&2) res += ((uint64_t)c.r[rdhi]<<32)|c.r[rdlo];   // accumulate (UMLAL/SMLAL)
+        c.r[rdlo]=(uint32_t)res; c.r[rdhi]=(uint32_t)(res>>32);
+        return;
+    }
+
+    compatLogFmt("arm32: UNIMPL Thumb2 %04x %04x pc=0x%x", hw1, hw2, pc);
+    c.halt = true; c.halt_pc = pc;
+}
+
+// ── Thumb step (16-bit + 32-bit Thumb-2) ────────────────────────────────────
 static void stepThumb(CpuState& c) {
     uint32_t pc = c.r[15];
     uint16_t op = *(uint16_t*)toHost(pc);
     c.r[15] = pc + 2;
 
-    // BL / BLX 32-bit pair (F000..FFFF prefix)
-    if ((op & 0xF800) == 0xF000) {
-        uint16_t op2 = *(uint16_t*)toHost(pc + 2);
-        c.r[15] = pc + 4;
-        int32_t off = ((int32_t)(op & 0x7FF) << 21) >> 9;   // high part sign-extended
-        off |= (op2 & 0x7FF) << 1;
-        uint32_t target = pc + 4 + off;
-        c.r[14] = (pc + 4) | 1;                             // LR (Thumb)
-        if ((op2 & 0xF800) == 0xE800) { c.cpsr &= ~C_T; target &= ~3u; }  // BLX → ARM
-        c.r[15] = target & ~1u;
-        return;
-    }
+    // 32-bit Thumb-2 (first halfword 0b111{01,10,11}...)
+    if ((op & 0xE000) == 0xE000 && (op & 0x1800) != 0) { stepThumb32(c, pc, op); return; }
     // Push/Pop
     if ((op & 0xFE00) == 0xB400) {          // PUSH
         uint32_t list = (op & 0xFF) | ((op & 0x100) ? 0x4000 : 0);   // R bit → LR

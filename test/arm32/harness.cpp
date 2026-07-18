@@ -157,6 +157,28 @@ int main() {
     // sxtb: r1=0x80 → r0 = 0xffffff80
     { CpuState c = runT({0x2080 /*movs r0,#0x80*/, 0xb241 /*sxtb r1,r0*/, 0x4770}); check("thumb sxtb", c.r[1], 0xffffff80u); }
 
+    // ── Thumb-2 32-bit (encodings verified via capstone) ──
+    // movw r0,#0x1234 ; movt r0,#0x5e78 → 0x5e781234
+    { CpuState c = runT({0xf241,0x2034 /*movw r0,#0x1234*/, 0xf6c5,0x6078 /*movt r0,#0x5e78*/, 0x4770});
+      check("t2 movw/movt", c.r[0], 0x5e781234u); }
+    // add.w r0,r1,#5 (r1=10)
+    { CpuState c = runT({0xf101,0x0005, 0x4770}, 0, 10); check("t2 add.w", c.r[0], 15); }
+    // sub.w r0,r1,#5 (r1=10)
+    { CpuState c = runT({0xf1a1,0x0005, 0x4770}, 0, 10); check("t2 sub.w", c.r[0], 5); }
+    // addw r0,r1,#0x64 (r1=1)
+    { CpuState c = runT({0xf201,0x0064, 0x4770}, 0, 1); check("t2 addw", c.r[0], 101); }
+    // str.w r0,[r1] ; ldr.w r2,[r1] (r0=0xdead, r1=0x1000)
+    { CpuState c = runT({0xf8c1,0x0000 /*str.w r0,[r1]*/, 0xf8d1,0x2000 /*ldr.w r2,[r1]*/, 0x4602 /*mov r2->? */, 0x4770}, 0xdead, 0x1000);
+      check("t2 str/ldr.w", c.r[2], 0xdead); }
+    // ubfx r0,r1,#16,#8 (r1=0x00AB0000 → 0xAB)
+    { CpuState c = runT({0xf3c1,0x4007, 0x4770}, 0, 0x00AB0000u); check("t2 ubfx", c.r[0], 0xAB); }
+    // orr.w r0,r1,r2 (r1=0xf0, r2=0x0f)
+    { CpuState c = runT({0xea41,0x0002, 0x4770}, 0, 0xf0, 0x0f); check("t2 orr.w", c.r[0], 0xff); }
+    // mul r0,r1,r2 (r1=6, r2=7)
+    { CpuState c = runT({0xfb01,0xf002, 0x4770}, 0, 6, 7); check("t2 mul", c.r[0], 42); }
+    // udiv r0,r1,r2 (r1=100, r2=7 → 14)
+    { CpuState c = runT({0xfbb1,0xf0f2, 0x4770}, 0, 100, 7); check("t2 udiv", c.r[0], 14); }
+
     printf("\narm32 harness: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
