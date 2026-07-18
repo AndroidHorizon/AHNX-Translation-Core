@@ -18,11 +18,15 @@ void requestAbort() { g_abort = true; }
 
 // CPSR bit helpers.
 enum { C_N=1u<<31, C_Z=1u<<30, C_C=1u<<29, C_V=1u<<28, C_T=1u<<5 };
+// 16-bit Thumb data-processing ops set flags implicitly — except inside an IT
+// block, where only the compare ops (which clear this) may. When set, the flag
+// setters below are no-ops.
+static bool g_it_suppress = false;
 static inline bool nf(CpuState& c){return c.cpsr&C_N;} static inline bool zf(CpuState& c){return c.cpsr&C_Z;}
 static inline bool cf(CpuState& c){return c.cpsr&C_C;} static inline bool vf(CpuState& c){return c.cpsr&C_V;}
-static inline void setNZ(CpuState& c, uint32_t r){ c.cpsr = (c.cpsr&~(C_N|C_Z)) | (r&0x80000000?C_N:0) | (r==0?C_Z:0); }
-static inline void setC(CpuState& c, bool v){ c.cpsr = v ? c.cpsr|C_C : c.cpsr&~C_C; }
-static inline void setV(CpuState& c, bool v){ c.cpsr = v ? c.cpsr|C_V : c.cpsr&~C_V; }
+static inline void setNZ(CpuState& c, uint32_t r){ if(g_it_suppress)return; c.cpsr = (c.cpsr&~(C_N|C_Z)) | (r&0x80000000?C_N:0) | (r==0?C_Z:0); }
+static inline void setC(CpuState& c, bool v){ if(g_it_suppress)return; c.cpsr = v ? c.cpsr|C_C : c.cpsr&~C_C; }
+static inline void setV(CpuState& c, bool v){ if(g_it_suppress)return; c.cpsr = v ? c.cpsr|C_V : c.cpsr&~C_V; }
 
 static uint32_t addWithCarry(CpuState& c, uint32_t a, uint32_t b, uint32_t cin, bool setflags) {
     uint64_t us = (uint64_t)a + b + cin;
@@ -210,6 +214,7 @@ static uint32_t shiftReg(CpuState& c, uint32_t val, uint32_t type, uint32_t amt,
 
 // ── ARM (32-bit) step ───────────────────────────────────────────────────────
 static void stepArm(CpuState& c) {
+    g_it_suppress = false;              // ARM has no IT; flags behave normally
     uint32_t pc = c.r[15];
     uint32_t insn = rd32(pc);
     c.r[15] = pc + 4;                       // default advance; PC reads as +8 in ARM
@@ -218,6 +223,13 @@ static void stepArm(CpuState& c) {
 
     // VFP / coprocessor 10-11
     if (isVFP(insn)) { if (execVFP(c, insn)) return; c.halt = true; c.halt_pc = pc; return; }
+
+    // CLZ / REV / REV16 / REVSH (precise masks — decoded before the generic
+    // data-processing and load/store branches that would misclassify them).
+    if ((insn & 0x0FFF0FF0) == 0x016F0F10) { uint32_t rd=(insn>>12)&0xF; c.r[rd]=c.r[insn&0xF]?(uint32_t)__builtin_clz(c.r[insn&0xF]):32; return; }
+    if ((insn & 0x0FFF0FF0) == 0x06BF0F30) { uint32_t rd=(insn>>12)&0xF; c.r[rd]=__builtin_bswap32(c.r[insn&0xF]); return; }
+    if ((insn & 0x0FFF0FF0) == 0x06BF0FB0) { uint32_t rd=(insn>>12)&0xF, v=c.r[insn&0xF]; c.r[rd]=((v&0xFF00FF00)>>8)|((v&0x00FF00FF)<<8); return; }
+    if ((insn & 0x0FFF0FF0) == 0x06FF0FB0) { uint32_t rd=(insn>>12)&0xF; c.r[rd]=(int32_t)(int16_t)__builtin_bswap16((uint16_t)c.r[insn&0xF]); return; }
 
     // Branch / BL (cond 101)
     if ((insn & 0x0E000000) == 0x0A000000) {
@@ -556,6 +568,46 @@ static void stepThumb32(CpuState& c, uint32_t pc, uint16_t hw1) {
         return;
     }
 
+    // ── TBB/TBH (table branch) — 1110 1000 1101 Rn ──
+    if ((hw1 & 0xFFF0) == 0xE8D0 && (hw2 & 0xFFE0) == 0xF000) {
+        uint32_t rn=hw1&0xF, rm=hw2&0xF, H=(hw2>>4)&1;
+        uint32_t base = (rn==15) ? (pc+4) : c.r[rn];
+        uint32_t idx = H ? rd16(base + 2*c.r[rm]) : rd8(base + c.r[rm]);
+        c.r[15] = pc + 4 + 2*idx;
+        return;
+    }
+    // ── CLZ — 1111 1010 1011 Rn : 1111 Rd 1000 Rm ──
+    if ((hw1 & 0xFFF0) == 0xFAB0 && (hw2 & 0xF0F0) == 0xF080) {
+        uint32_t rm=hw2&0xF, rd=(hw2>>8)&0xF;
+        c.r[rd] = c.r[rm] ? (uint32_t)__builtin_clz(c.r[rm]) : 32;
+        return;
+    }
+    // ── REV/REV16/RBIT/REVSH — 1111 1010 1001 Rn ──
+    if ((hw1 & 0xFFF0) == 0xFA90 && (hw2 & 0xF0C0) == 0xF080) {
+        uint32_t rm=hw2&0xF, rd=(hw2>>8)&0xF, v=c.r[rm];
+        switch ((hw2>>4)&3) {
+            case 0: c.r[rd]=__builtin_bswap32(v); break;
+            case 1: c.r[rd]=((v&0xFF00FF00)>>8)|((v&0x00FF00FF)<<8); break;
+            case 2: { uint32_t r=0; for(int i=0;i<32;i++) if(v&(1u<<i)) r|=1u<<(31-i); c.r[rd]=r; } break;
+            case 3: c.r[rd]=(int32_t)(int16_t)__builtin_bswap16((uint16_t)v); break;
+        }
+        return;
+    }
+    // ── SXTB/SXTH/UXTB/UXTH (+AB/AH accumulate) — 1111 1010 0xxx Rn ──
+    if ((hw1 & 0xFF80) == 0xFA00 && (hw2 & 0xF080) == 0xF080) {
+        uint32_t rm=hw2&0xF, rd=(hw2>>8)&0xF, rn=hw1&0xF, rot=((hw2>>4)&3)*8;
+        uint32_t v = rot ? ((c.r[rm]>>rot)|(c.r[rm]<<(32-rot))) : c.r[rm], ext;
+        switch ((hw1>>4)&7) {
+            case 0: ext=(int32_t)(int16_t)v; break;   // SXTH
+            case 1: ext=v&0xFFFF; break;              // UXTH
+            case 4: ext=(int32_t)(int8_t)v; break;    // SXTB
+            case 5: ext=v&0xFF; break;                // UXTB
+            default: ext=v;
+        }
+        c.r[rd] = (rn==15) ? ext : c.r[rn]+ext;
+        return;
+    }
+
     compatLogFmt("arm32: UNIMPL Thumb2 %04x %04x pc=0x%x", hw1, hw2, pc);
     c.halt = true; c.halt_pc = pc;
 }
@@ -564,10 +616,31 @@ static void stepThumb32(CpuState& c, uint32_t pc, uint16_t hw1) {
 static void stepThumb(CpuState& c) {
     uint32_t pc = c.r[15];
     uint16_t op = *(uint16_t*)toHost(pc);
+    bool is32 = (op & 0xE000) == 0xE000 && (op & 0x1800) != 0;
+
+    // Inside an IT block, this instruction executes conditionally. Advance the
+    // IT state regardless, and skip (just step PC) when its condition fails.
+    bool inIT = c.itstate != 0;
+    if (inIT) {
+        uint32_t cond = c.itstate >> 4;
+        bool exec = condPass(c, cond);
+        c.itstate = (c.itstate & 7) ? ((c.itstate & 0xE0) | ((c.itstate << 1) & 0x1F)) : 0;
+        if (!exec) { c.r[15] = pc + (is32 ? 4 : 2); return; }
+    }
+
     c.r[15] = pc + 2;
 
-    // 32-bit Thumb-2 (first halfword 0b111{01,10,11}...)
-    if ((op & 0xE000) == 0xE000 && (op & 0x1800) != 0) { stepThumb32(c, pc, op); return; }
+    // 32-bit Thumb-2 (respects its own S bits, so no implicit-flag suppression)
+    if (is32) { g_it_suppress = false; stepThumb32(c, pc, op); return; }
+
+    // 16-bit inside an IT block: suppress implicit flag updates (compare ops
+    // below re-enable them, since setting flags is their whole purpose).
+    g_it_suppress = inIT;
+
+    // IT (if-then): set up conditional execution for the next 1-4 instructions.
+    if ((op & 0xFF00) == 0xBF00 && (op & 0x000F) != 0) { c.itstate = op & 0xFF; return; }
+    // NOP/hints (BF00, and the 16-bit hint space) — ignore.
+    if ((op & 0xFF0F) == 0xBF00) return;
     // Push/Pop
     if ((op & 0xFE00) == 0xB400) {          // PUSH
         uint32_t list = (op & 0xFF) | ((op & 0x100) ? 0x4000 : 0);   // R bit → LR
@@ -609,7 +682,7 @@ static void stepThumb(CpuState& c) {
         uint32_t sub=(op>>11)&3, rd=(op>>8)&7, imm=op&0xFF;
         switch (sub) {
             case 0: c.r[rd]=imm; setNZ(c,imm); break;                       // MOV
-            case 1: addWithCarry(c, c.r[rd], ~imm, 1, true); break;         // CMP
+            case 1: g_it_suppress=false; addWithCarry(c, c.r[rd], ~imm, 1, true); break; // CMP
             case 2: c.r[rd]=addWithCarry(c, c.r[rd], imm, 0, true); break;  // ADD
             case 3: c.r[rd]=addWithCarry(c, c.r[rd], ~imm, 1, true); break; // SUB
         }
@@ -644,10 +717,10 @@ static void stepThumb(CpuState& c) {
             case 0x5: r=addWithCarry(c,a,b,cf(c),true); break;         // ADC
             case 0x6: r=addWithCarry(c,a,~b,cf(c),true); break;        // SBC
             case 0x7: r=shiftImm(c,a,3,b&0xFF,true,co); setNZ(c,r); setC(c,co); break; // ROR reg
-            case 0x8: setNZ(c,a&b); return;                            // TST (no wb)
+            case 0x8: g_it_suppress=false; setNZ(c,a&b); return;       // TST (no wb)
             case 0x9: r=addWithCarry(c,0,~b,1,true); break;            // NEG (RSB #0)
-            case 0xA: addWithCarry(c,a,~b,1,true); return;             // CMP (no wb)
-            case 0xB: addWithCarry(c,a,b,0,true); return;              // CMN (no wb)
+            case 0xA: g_it_suppress=false; addWithCarry(c,a,~b,1,true); return; // CMP (no wb)
+            case 0xB: g_it_suppress=false; addWithCarry(c,a,b,0,true); return;  // CMN (no wb)
             case 0xC: r=a|b; setNZ(c,r); break;                        // ORR
             case 0xD: r=a*b; setNZ(c,r); break;                        // MUL
             case 0xE: r=a&~b; setNZ(c,r); break;                       // BIC
@@ -662,7 +735,7 @@ static void stepThumb(CpuState& c) {
         uint32_t vm = (rm==15)?(pc+4):c.r[rm];
         switch (aop) {
             case 0: { uint32_t v=c.r[rd]+vm; if(rd==15){c.r[15]=v&~1u;} else c.r[rd]=v; } return; // ADD
-            case 1: addWithCarry(c, c.r[rd], ~vm, 1, true); return;    // CMP
+            case 1: g_it_suppress=false; addWithCarry(c, c.r[rd], ~vm, 1, true); return; // CMP (hi)
             case 2: if(rd==15){c.cpsr=(vm&1)?(c.cpsr|C_T):(c.cpsr&~C_T); c.r[15]=vm&~1u;} else c.r[rd]=vm; return; // MOV
         }
         return;
@@ -739,6 +812,24 @@ static void stepThumb(CpuState& c) {
         uint32_t rn=(op>>8)&7, list=op&0xFF, a=c.r[rn]; bool load=(op>>11)&1;
         for (int i=0;i<8;i++) if (list&(1<<i)) { if(load) c.r[i]=rd32(a); else wr32(a,c.r[i]); a+=4; }
         if (!(load && (list&(1<<rn)))) c.r[rn]=a;   // writeback unless loaded rn
+        return;
+    }
+
+    // REV/REV16/REVSH — 1011 1010
+    if ((op & 0xFF00) == 0xBA00) {
+        uint32_t rd=op&7, rm=(op>>3)&7, v=c.r[rm];
+        switch ((op>>6)&3) {
+            case 0: c.r[rd]=__builtin_bswap32(v); break;                                 // REV
+            case 1: c.r[rd]=((v&0xFF00FF00)>>8)|((v&0x00FF00FF)<<8); break;               // REV16
+            case 3: c.r[rd]=(int32_t)(int16_t)__builtin_bswap16((uint16_t)v); break;      // REVSH
+        }
+        return;
+    }
+    // CBZ/CBNZ — 1011 x0x1
+    if ((op & 0xF500) == 0xB100) {
+        uint32_t rn=op&7; bool nz=(op>>11)&1;
+        uint32_t imm=(((op>>9)&1)<<6)|(((op>>3)&0x1F)<<1);
+        if ((c.r[rn]==0) != nz) c.r[15] = pc + 4 + imm;
         return;
     }
 

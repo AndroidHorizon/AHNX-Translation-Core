@@ -23,6 +23,7 @@ struct CpuState {
     uint32_t r[16];        // r0..r15 (r13=SP, r14=LR, r15=PC)
     uint32_t cpsr;         // NZCV + T(humb) bit (bit 5)
     uint64_t vfp[32];      // s0..s31 packed as d0..d15 halves (VFP/NEON) — d view
+    uint8_t  itstate;      // Thumb IT block: firstcond<<4 | mask (0 = not in block)
     bool     halt;         // interpreter requested stop
     uint32_t halt_pc;      // where it stopped
 };

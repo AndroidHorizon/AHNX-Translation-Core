@@ -198,6 +198,22 @@ int main() {
       // read back what's in memory at 0x1000
       check("vfp vstr mem", *(uint32_t*)(g_base+0x1000), 0x40a00000u); }
 
+    // ── IT block: itt eq ; moveq r0,#1 ; moveq r0,#2 (cond true when r0==r1) ──
+    // set flags with cmp r0,r1 (equal), then IT EQ executing two movs
+    { CpuState c = runT({0x4288 /*cmp r0,r1*/, 0xbf04 /*itt eq*/, 0x2001 /*movs r0,#1*/, 0x2002 /*mov r0,#2*/, 0x4770}, 5, 5);
+      check("it-block eq taken", c.r[0], 2); }
+    // IT with false condition: cmp r0,r1 (not equal) → itt eq skips both
+    { CpuState c = runT({0x4288 /*cmp r0,r1*/, 0xbf04 /*itt eq*/, 0x2001, 0x2002, 0x4770}, 5, 9);
+      check("it-block eq skipped", c.r[0], 5); }
+    // CBZ r0,#0x1006: at 0x1000 → skips movs(0x1002) + nop(0x1004) to bx lr(0x1006)
+    { CpuState c = runT({0xb108 /*cbz r0*/, 0x2007 /*movs r0,#7*/, 0xbf00 /*nop*/, 0x4770 /*bx lr*/}, 0);
+      check("cbz taken", c.r[0], 0); }
+    // REV (thumb): r1=0x11223344 → r0=0x44332211
+    { CpuState c = runT({0x2000, 0xba08 /*rev r0,r1*/, 0x4770}, 0, 0x11223344u); check("thumb rev", c.r[0], 0x44332211u); }
+    // ARM CLZ: r1=0x00010000 → 15
+    { uint32_t p[] = {0xe3a01801 /*mov r1,#0x10000*/, 0xe16f0f11 /*clz r0,r1*/, 0xe12fff1e};
+      CpuState c = runProg(p, 3, false); check("arm clz", c.r[0], 15); }
+
     printf("\narm32 harness: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
