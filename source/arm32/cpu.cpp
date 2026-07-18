@@ -69,6 +69,19 @@ static uint32_t shiftImm(CpuState& c, uint32_t val, uint32_t type, uint32_t amt,
     (void)setc; return val;
 }
 
+// Shift by a register amount (differs from immediate at boundary cases).
+static uint32_t shiftReg(CpuState& c, uint32_t val, uint32_t type, uint32_t amt, bool& carry) {
+    carry = cf(c);
+    if (amt == 0) return val;
+    switch (type) {
+        case 0: if (amt>=32){carry=amt==32?val&1:0; return 0;} carry=(val>>(32-amt))&1; return val<<amt;                 // LSL
+        case 1: if (amt>=32){carry=amt==32?(val>>31)&1:0; return 0;} carry=(val>>(amt-1))&1; return val>>amt;            // LSR
+        case 2: if (amt>=32){carry=(val>>31)&1; return (uint32_t)((int32_t)val>>31);} carry=((int32_t)val>>(amt-1))&1; return (uint32_t)((int32_t)val>>amt); // ASR
+        case 3: { amt&=31; if(!amt) return val; carry=(val>>(amt-1))&1; return (val>>amt)|(val<<(32-amt)); }             // ROR
+    }
+    return val;
+}
+
 // ── ARM (32-bit) step ───────────────────────────────────────────────────────
 static void stepArm(CpuState& c) {
     uint32_t pc = c.r[15];
@@ -100,7 +113,44 @@ static void stepArm(CpuState& c) {
         else                   c.r[rd] = imm16;                               // MOVW
         return;
     }
-    // Data processing (bits 27-26 == 00), immediate or register shift (no reg-shift-by-reg yet)
+    // Multiply MUL/MLA (bits 27-22=0, 7-4=1001) — decode before data-processing
+    if ((insn & 0x0FC000F0) == 0x00000090) {
+        uint32_t rd=(insn>>16)&0xF, rn=(insn>>12)&0xF, rs=(insn>>8)&0xF, rm=insn&0xF;
+        bool A=(insn>>21)&1, S=(insn>>20)&1;
+        uint32_t r = c.r[rm]*c.r[rs] + (A?c.r[rn]:0);
+        c.r[rd]=r; if (S) setNZ(c,r);
+        return;
+    }
+    // Long multiply UMULL/UMLAL/SMULL/SMLAL (bits 27-23=00001, 7-4=1001)
+    if ((insn & 0x0F8000F0) == 0x00800090) {
+        uint32_t rdhi=(insn>>16)&0xF, rdlo=(insn>>12)&0xF, rs=(insn>>8)&0xF, rm=insn&0xF;
+        bool sign=(insn>>22)&1, A=(insn>>21)&1, S=(insn>>20)&1;
+        uint64_t res = sign ? (uint64_t)((int64_t)(int32_t)c.r[rm]*(int64_t)(int32_t)c.r[rs])
+                            : (uint64_t)c.r[rm]*(uint64_t)c.r[rs];
+        if (A) res += ((uint64_t)c.r[rdhi]<<32) | c.r[rdlo];
+        c.r[rdlo]=(uint32_t)res; c.r[rdhi]=(uint32_t)(res>>32);
+        if (S) { c.cpsr = (c.cpsr&~(C_N|C_Z)) | ((c.r[rdhi]&0x80000000)?C_N:0) | ((res==0)?C_Z:0); }
+        return;
+    }
+    // Extra load/store: LDRH/STRH/LDRSB/LDRSH (bits 27-25=0, bit7=1, bit4=1, SH!=00)
+    if ((insn & 0x0E000090) == 0x00000090 && ((insn>>5)&3) != 0) {
+        bool P=(insn>>24)&1, U=(insn>>23)&1, I=(insn>>22)&1, W=(insn>>21)&1, L=(insn>>20)&1;
+        uint32_t rn=(insn>>16)&0xF, rd=(insn>>12)&0xF, sh=(insn>>5)&3;
+        uint32_t off = I ? ((((insn>>8)&0xF)<<4)|(insn&0xF)) : c.r[insn&0xF];
+        uint32_t base = c.r[rn], addr = P ? (U?base+off:base-off) : base;
+        if (L) {
+            if (sh==1) c.r[rd]=rd16(addr);
+            else if (sh==2) c.r[rd]=(int32_t)(int8_t)rd8(addr);
+            else c.r[rd]=(int32_t)(int16_t)rd16(addr);
+        } else if (sh==1) {
+            wr16(addr, (uint16_t)c.r[rd]);              // STRH (LDRD/STRD sh=2/3 unhandled)
+        }
+        if (!P) addr = U?base+off:base-off;
+        if ((!P||W) && rn!=rd) c.r[rn]=addr;
+        return;
+    }
+
+    // Data processing (bits 27-26 == 00), immediate / reg-imm-shift / reg-reg-shift
     if ((insn & 0x0C000000) == 0x00000000) {
         uint32_t op = (insn >> 21) & 0xF;
         bool     S  = (insn >> 20) & 1;
@@ -113,7 +163,10 @@ static void stepArm(CpuState& c) {
         } else if ((insn & 0x10) == 0) {                  // register, immediate shift
             uint32_t rm = c.r[insn & 0xF], type = (insn >> 5) & 3, amt = (insn >> 7) & 0x1F;
             opnd = shiftImm(c, rm, type, amt, S, shco);
-        } else { compatLogFmt("arm32: UNIMPL dp reg-shift-reg pc=0x%x insn=0x%08x", pc, insn); c.halt = true; c.halt_pc = pc; return; }
+        } else {                                          // register, register shift
+            uint32_t rm = c.r[insn & 0xF], type = (insn >> 5) & 3, amt = c.r[(insn >> 8) & 0xF] & 0xFF;
+            opnd = shiftReg(c, rm, type, amt, shco);
+        }
         uint32_t vn = c.r[rn], res = 0; bool wb = true;
         switch (op) {
             case 0x0: res = vn & opnd; break;                         // AND
@@ -140,16 +193,17 @@ static void stepArm(CpuState& c) {
         }
         return;
     }
-    // Single data transfer LDR/STR (bits 27-26 == 01), immediate offset only
-    if ((insn & 0x0C000000) == 0x04000000 && (insn & 0x02000000) == 0) {
-        bool P=(insn>>24)&1, U=(insn>>23)&1, B=(insn>>22)&1, W=(insn>>21)&1, L=(insn>>20)&1;
-        uint32_t rn=(insn>>16)&0xF, rd=(insn>>12)&0xF, imm=insn&0xFFF;
+    // Single data transfer LDR/STR (bits 27-26 == 01), immediate or reg offset
+    if ((insn & 0x0C000000) == 0x04000000) {
+        bool I=(insn>>25)&1, P=(insn>>24)&1, U=(insn>>23)&1, B=(insn>>22)&1, W=(insn>>21)&1, L=(insn>>20)&1;
+        uint32_t rn=(insn>>16)&0xF, rd=(insn>>12)&0xF, off;
+        if (!I) off = insn & 0xFFF;
+        else { uint32_t rm=c.r[insn&0xF], type=(insn>>5)&3, amt=(insn>>7)&0x1F; bool co; off=shiftImm(c,rm,type,amt,false,co); }
         uint32_t base = (rn==15) ? (pc+8) : c.r[rn];
-        uint32_t addr = P ? (U?base+imm:base-imm) : base;
-        if (!guestValid(addr, B?1:4)) { compatLogFmt("arm32: bad LDR/STR addr=0x%x pc=0x%x", addr, pc); c.halt=true; c.halt_pc=pc; return; }
-        if (L) c.r[rd] = B ? *toHost(addr) : rd32(addr);
-        else   { if (B) *toHost(addr)=(uint8_t)c.r[rd]; else wr32(addr, c.r[rd]); }
-        if (!P) addr = U?base+imm:base-imm;
+        uint32_t addr = P ? (U?base+off:base-off) : base;
+        if (L) c.r[rd] = B ? rd8(addr) : rd32(addr);
+        else   { if (B) wr8(addr,(uint8_t)c.r[rd]); else wr32(addr, c.r[rd]); }
+        if (!P) addr = U?base+off:base-off;
         if ((!P || W) && rn != 15 && rn != rd) c.r[rn] = addr;
         if (L && rd == 15) { c.cpsr=(c.r[15]&1)?(c.cpsr|C_T):(c.cpsr&~C_T); c.r[15]&=~1u; }
         return;

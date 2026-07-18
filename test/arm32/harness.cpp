@@ -90,6 +90,29 @@ int main() {
 
     // ── ARM: BL to a sentinel import (bridge) ── mov r0,#1; b to a sentinel? use blx? skip.
 
+    // ── ARM: MUL (6*7=42) ──
+    { uint32_t p[] = {0xe3a00006 /*mov r0,#6*/, 0xe3a01007 /*mov r1,#7*/,
+                      0xe0020190 /*mul r2,r0,r1*/, 0xe1a00002 /*mov r0,r2*/, 0xe12fff1e};
+      CpuState c = runProg(p, 5, false); check("arm mul", c.r[0], 42); }
+    // ── ARM: UMULL (0x10000 * 0x10000 = 0x1_0000_0000) ──
+    { uint32_t p[] = {0xe3a00801 /*mov r0,#0x10000*/, 0xe1a01000 /*mov r1,r0*/,
+                      0xe0832190 /*umull r2,r3,r0,r1*/, 0xe1a00003 /*mov r0,r3*/, 0xe12fff1e};
+      CpuState c = runProg(p, 5, false); check("arm umull hi", c.r[0], 1); }
+    // ── ARM: reg-shift-reg (mov r0, r1, lsl r2) 3<<4=48 ──
+    { uint32_t p[] = {0xe3a01003 /*mov r1,#3*/, 0xe3a02004 /*mov r2,#4*/,
+                      0xe1a00211 /*lsl r0,r1,r2*/, 0xe12fff1e};
+      CpuState c = runProg(p, 4, false); check("arm lsl reg", c.r[0], 48); }
+    // ── ARM: LDRH/STRH round-trip ──
+    { uint32_t p[] = {0xe3a0000f /*mov r0,#15*/, 0xe3a01a01 /*mov r1,#0x1000*/,
+                      0xe1c100b0 /*strh r0,[r1]*/, 0xe1d120b0 /*ldrh r2,[r1]*/,
+                      0xe1a00002 /*mov r0,r2*/, 0xe12fff1e};
+      CpuState c = runProg(p, 6, false); check("arm strh/ldrh", c.r[0], 15); }
+    // ── ARM: LDRB register offset ──
+    { uint32_t p[] = {0xe3a000ab /*mov r0,#0xab*/, 0xe3a01a01 /*mov r1,#0x1000*/,
+                      0xe5c10000 /*strb r0,[r1]*/, 0xe5d12000 /*ldrb r2,[r1]*/,
+                      0xe1a00002 /*mov r0,r2*/, 0xe12fff1e};
+      CpuState c = runProg(p, 6, false); check("arm strb/ldrb", c.r[0], 0xab); }
+
     // ── Thumb: MOV imm, ADD imm, BX lr ──
     { uint16_t t[] = {0x2005 /*movs r0,#5*/, 0x3003 /*adds r0,#3*/, 0x4770 /*bx lr*/};
       uint32_t buf[2]; memcpy(buf, t, sizeof(t));
